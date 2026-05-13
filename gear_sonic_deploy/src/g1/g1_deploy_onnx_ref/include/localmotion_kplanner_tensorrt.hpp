@@ -36,10 +36,9 @@
 #ifndef LOCALMOTION_KPLANNER_TENSORRT_HPP
 #define LOCALMOTION_KPLANNER_TENSORRT_HPP
 
-#include <TRTInference/InferenceEngine.h>
+#include "inference_backend.hpp"
 #include <iostream>
 #include "localmotion_kplanner.hpp"
-#include <cuda_runtime.h>
 
 /**
  * @class LocalMotionPlannerTensorRT
@@ -240,11 +239,19 @@ private:
             return false;
         }
         
-        // Initialize the TensorRT inference engine
+#ifdef USE_OPENVINO
+        // Planner: use CPU (GPU not supported for this model)
+        if (!inference_engine_->Initialize(cachedTRTFile, "CPU",
+                use_fp16_ ? Precision::FP16 : Precision::FP32)) {
+            std::cout << "✗ Failed to initialize planner on CPU: " << cachedTRTFile << std::endl;
+            return false;
+        }
+#else
         if (!inference_engine_->Initialize(cachedTRTFile, options.deviceID, options.dynamic_axes_names)) {
             std::cout << "✗ Failed to initialize TensorRT model: " << cachedTRTFile << std::endl;
             return false;
         }
+#endif
         
         // Initialize engine inputs
         if (!inference_engine_->InitInputs({})) {

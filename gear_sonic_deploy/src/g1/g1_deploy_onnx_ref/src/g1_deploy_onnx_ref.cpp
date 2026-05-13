@@ -46,7 +46,9 @@
  *   --policy-fp16         | Use FP16 for policy TensorRT engine
  */
 #include <cmath>
+#ifndef USE_OPENVINO
 #include <cuda_runtime_api.h>
+#endif
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -76,11 +78,13 @@
 #include <unitree/idl/hg/LowState_.hpp>
 #include <unitree/robot/b2/motion_switcher/motion_switcher_client.hpp>
 
-// TRTInference
-#include <TRTInference/InferenceEngine.h>
+// Inference backend (TensorRT or OpenVINO)
+#include "../include/inference_backend.hpp"
 
-// ONNX
+// ONNX Runtime (only needed for non-OpenVINO builds or if ORT is available)
+#if !defined(USE_OPENVINO) || defined(HAS_ONNXRUNTIME)
 #include <onnxruntime_cxx_api.h>
+#endif
 
 // Motion Data Reader
 #include "../include/motion_data_reader.hpp"
@@ -121,7 +125,9 @@
 
 #include "../include/output_interface/zmq_output_handler.hpp"
 
+#ifndef USE_OPENVINO
 #include <cuda_runtime.h>
+#endif
 #include "../include/state_logger.hpp"
 
 // Encoder

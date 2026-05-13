@@ -39,8 +39,7 @@
 #include <iostream>
 #include <algorithm>
 #include <numeric>
-#include <cuda_runtime.h>
-#include <TRTInference/InferenceEngine.h>
+#include "inference_backend.hpp"
 
 /**
  * @class EncoderEngine

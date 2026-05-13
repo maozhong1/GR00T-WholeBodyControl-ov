@@ -5,6 +5,41 @@
 
 echo "🔧 Setting up G1 Deploy environment..."
 
+# ── OpenVINO detection ─────────────────────────────────────────────────────
+# Check for OpenVINO installation and set USE_OPENVINO=1 if found
+OPENVINO_FOUND=false
+OPENVINO_PATHS=(
+    "/opt/intel/openvino_2026"
+    "/opt/intel/openvino"
+    "/opt/intel/openvino_2025"
+    "$HOME/intel/openvino"
+)
+
+for ov_path in "${OPENVINO_PATHS[@]}"; do
+    if [ -f "$ov_path/setupvars.sh" ]; then
+        echo "✅ OpenVINO found at: $ov_path"
+        source "$ov_path/setupvars.sh" 2>/dev/null || true
+        export OpenVINO_DIR="$ov_path/runtime/cmake"
+        export USE_OPENVINO=1
+        OPENVINO_FOUND=true
+        break
+    fi
+done
+
+if [ "$OPENVINO_FOUND" = false ]; then
+    # Try pkg-config or cmake find
+    if pkg-config --exists openvino 2>/dev/null; then
+        echo "✅ OpenVINO found via pkg-config"
+        export USE_OPENVINO=1
+        OPENVINO_FOUND=true
+    fi
+fi
+
+if [ "$OPENVINO_FOUND" = true ]; then
+    echo "🔵 OpenVINO mode enabled (USE_OPENVINO=1)"
+    echo "   CUDA/TensorRT detection will be skipped"
+fi
+
 # Run jetson_clocks on Jetson systems (bare-metal only)
 if command -v jetson_clocks &> /dev/null; then
     if [ -f "/.dockerenv" ]; then
@@ -162,9 +197,10 @@ if [ -f "src/g1/g1_deploy_onnx_ref/config/fastrtps_profile.xml" ]; then
     echo "✅ FastRTPS production profile configured"
 fi
 
-# TensorRT Environment Setup
-# Check if TensorRT_ROOT is already set, if not try to load from .bashrc
-if [ -z "$TensorRT_ROOT" ] && [ -f "$HOME/.bashrc" ]; then
+# TensorRT Environment Setup (skip if OpenVINO mode)
+if [ "$OPENVINO_FOUND" = true ]; then
+    echo "ℹ️  Skipping TensorRT setup (OpenVINO mode)"
+elif [ -z "$TensorRT_ROOT" ] && [ -f "$HOME/.bashrc" ]; then
     # Extract TensorRT_ROOT from .bashrc if it exists
     BASHRC_TENSORRT=$(grep -o 'export TensorRT_ROOT=.*' "$HOME/.bashrc" | head -n1 | cut -d'=' -f2 | tr -d '"' | envsubst)
     if [ -n "$BASHRC_TENSORRT" ]; then
@@ -173,41 +209,43 @@ if [ -z "$TensorRT_ROOT" ] && [ -f "$HOME/.bashrc" ]; then
     fi
 fi
 
-if [ -n "$TensorRT_ROOT" ]; then
-    export LD_LIBRARY_PATH="$TensorRT_ROOT/lib:$LD_LIBRARY_PATH"
-    echo "✅ TensorRT environment configured"
-    
-    # For Jetson systems, ensure DLA libraries are accessible for runtime
-    if [[ "$ARCH" == "aarch64" ]] && [[ -f "/etc/nv_tegra_release" || -d "/usr/src/jetson_multimedia_api" ]]; then
-        echo "🤖 Jetson system detected - setting up DLA library paths for runtime"
-        
-        # Create missing libcudla.so.1 symlink if needed (TensorRT expects this name)
-        if [ -f "/usr/lib/aarch64-linux-gnu/nvidia/libnvcudla.so" ] && [ ! -f "/usr/lib/aarch64-linux-gnu/nvidia/libcudla.so.1" ]; then
-            echo "   🔗 Creating libcudla.so.1 symlink for TensorRT compatibility..."
-            sudo ln -sf libnvcudla.so /usr/lib/aarch64-linux-gnu/nvidia/libcudla.so.1 2>/dev/null || echo "   ⚠️  Could not create symlink (may need sudo)"
-            sudo ln -sf libnvcudla.so /usr/lib/aarch64-linux-gnu/nvidia/libcudla.so 2>/dev/null || echo "   ⚠️  Could not create symlink (may need sudo)"
-            echo "   ✅ libcudla.so.1 → libnvcudla.so"
-        fi
-        
-        # CRITICAL: Add DLA library path for runtime (this is why your executable can't run)
-        export LD_LIBRARY_PATH="/usr/lib/aarch64-linux-gnu/nvidia:$LD_LIBRARY_PATH"
-        echo "   📁 Added DLA library path to current session"
-        
-        # Make it persistent so you don't need to run setup_env.sh every time
-        if ! grep -q "/usr/lib/aarch64-linux-gnu/nvidia" ~/.bashrc 2>/dev/null; then
-            echo 'export LD_LIBRARY_PATH="/usr/lib/aarch64-linux-gnu/nvidia:$LD_LIBRARY_PATH"' >> ~/.bashrc
-            echo "   ✅ Added DLA library path to ~/.bashrc for future sessions"
-        fi
-        
-        echo "   ℹ️  Your executable should now be able to find DLA libraries at runtime"
-    fi
-else
-    echo "⚠️  TensorRT_ROOT is not set"
-    echo "   Please install TensorRT and add 'export TensorRT_ROOT=/path/to/tensorrt' to your ~/.bashrc"
-    echo "   Or source ~/.bashrc before running this script"
+if [ "$OPENVINO_FOUND" != true ]; then
+  if [ -n "$TensorRT_ROOT" ]; then
+      export LD_LIBRARY_PATH="$TensorRT_ROOT/lib:$LD_LIBRARY_PATH"
+      echo "✅ TensorRT environment configured"
+
+      # For Jetson systems, ensure DLA libraries are accessible for runtime
+      if [[ "$ARCH" == "aarch64" ]] && [[ -f "/etc/nv_tegra_release" || -d "/usr/src/jetson_multimedia_api" ]]; then
+          echo "🤖 Jetson system detected - setting up DLA library paths for runtime"
+
+          if [ -f "/usr/lib/aarch64-linux-gnu/nvidia/libnvcudla.so" ] && [ ! -f "/usr/lib/aarch64-linux-gnu/nvidia/libcudla.so.1" ]; then
+              echo "   🔗 Creating libcudla.so.1 symlink for TensorRT compatibility..."
+              sudo ln -sf libnvcudla.so /usr/lib/aarch64-linux-gnu/nvidia/libcudla.so.1 2>/dev/null || echo "   ⚠️  Could not create symlink (may need sudo)"
+              sudo ln -sf libnvcudla.so /usr/lib/aarch64-linux-gnu/nvidia/libcudla.so 2>/dev/null || echo "   ⚠️  Could not create symlink (may need sudo)"
+              echo "   ✅ libcudla.so.1 → libnvcudla.so"
+          fi
+
+          export LD_LIBRARY_PATH="/usr/lib/aarch64-linux-gnu/nvidia:$LD_LIBRARY_PATH"
+          echo "   📁 Added DLA library path to current session"
+
+          if ! grep -q "/usr/lib/aarch64-linux-gnu/nvidia" ~/.bashrc 2>/dev/null; then
+              echo 'export LD_LIBRARY_PATH="/usr/lib/aarch64-linux-gnu/nvidia:$LD_LIBRARY_PATH"' >> ~/.bashrc
+              echo "   ✅ Added DLA library path to ~/.bashrc for future sessions"
+          fi
+
+          echo "   ℹ️  Your executable should now be able to find DLA libraries at runtime"
+      fi
+  else
+      echo "⚠️  TensorRT_ROOT is not set"
+      echo "   Please install TensorRT and add 'export TensorRT_ROOT=/path/to/tensorrt' to your ~/.bashrc"
+      echo "   Or source ~/.bashrc before running this script"
+  fi
 fi
 
-# CUDA Environment Setup
+# CUDA Environment Setup (skip if OpenVINO mode)
+if [ "$OPENVINO_FOUND" = true ]; then
+    echo "ℹ️  Skipping CUDA setup (OpenVINO mode — no CUDA required)"
+else
 echo "🔧 Setting up CUDA environment..."
 
 # Function to detect and set CUDA toolkit root
@@ -295,6 +333,8 @@ else
         echo "========================================================================"
     fi
 fi
+
+fi  # end of OPENVINO_FOUND != true (CUDA section)
 
 # Add ONNX Runtime to library path if not already there
 if [ -d "/opt/onnxruntime/lib" ]; then
