@@ -51,6 +51,8 @@
 #include <shared_mutex>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
+#include <atomic>
 #include <array>
 #include <vector>
 #include <algorithm>
@@ -4081,7 +4083,20 @@ class G1Deploy {
  * All other arguments are optional flags (see --help for full list).
  * The main loop sleeps until the operator issues a stop signal or ROS2 shuts down.
  */
+
+// Global flag for signal handler → main loop communication
+static std::atomic<bool> g_signal_received{false};
+
+static void SignalHandler(int signum) {
+  std::cout << "\n[INFO] Signal " << signum << " received, shutting down gracefully..." << std::endl;
+  g_signal_received.store(true);
+}
+
 int main(int argc, char const* argv[]) {
+  // Install signal handlers for graceful shutdown
+  signal(SIGINT, SignalHandler);
+  signal(SIGTERM, SignalHandler);
+
   std::cout << "[DEBUG] Program starting..." << std::endl;
   if (argc < 4) {
     std::cout << "Usage: " << argv[0] << " <network_interface> <policy_file> <motion_data_path> [OPTIONS]"
@@ -4433,20 +4448,20 @@ int main(int argc, char const* argv[]) {
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   
-  // Main application loop - check both operator_state.stop and ROS2 status if using ROS2
+  // Main application loop - check stop flag and signal
 #if HAS_ROS2
   if (inputType == "ros2") {
-    while (!custom.operator_state.stop && rclcpp::ok()) { 
-      sleep(0.02); 
+    while (!custom.operator_state.stop && !g_signal_received.load() && rclcpp::ok()) {
+      usleep(20000);
     }
     if (!rclcpp::ok()) {
       std::cout << "[INFO] ROS2 shutdown detected (Ctrl+C)" << std::endl;
     }
   } else {
-    while (!custom.operator_state.stop) { sleep(0.02); }
+    while (!custom.operator_state.stop && !g_signal_received.load()) { usleep(20000); }
   }
 #else
-  while (!custom.operator_state.stop) { sleep(0.02); }
+  while (!custom.operator_state.stop && !g_signal_received.load()) { usleep(20000); }
 #endif
   
   std::cout << "[DEBUG] Stopping G1Deploy..." << std::endl;

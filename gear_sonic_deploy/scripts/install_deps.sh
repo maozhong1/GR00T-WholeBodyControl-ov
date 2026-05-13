@@ -3,6 +3,23 @@
 set -e
 
 echo "🚀 Installing G1 Deploy system dependencies..."
+
+# ============================================================================
+# OpenVINO Mode Detection
+# ============================================================================
+# If OpenVINO is installed, skip CUDA/TensorRT/ONNX Runtime entirely.
+USE_OPENVINO_MODE=false
+if [ "${USE_OPENVINO:-0}" = "1" ]; then
+    USE_OPENVINO_MODE=true
+elif [ -f "/opt/intel/openvino_2026/setupvars.sh" ] || \
+     [ -f "/opt/intel/openvino/setupvars.sh" ]; then
+    USE_OPENVINO_MODE=true
+fi
+
+if [ "$USE_OPENVINO_MODE" = true ]; then
+    echo "🔵 OpenVINO mode detected — CUDA/TensorRT/ONNX Runtime will be SKIPPED"
+fi
+
 sudo apt-get update && sudo apt-get install -y libgtest-dev
 
 # Detect system type and architecture
@@ -373,7 +390,10 @@ else
     echo "✅ Just is already installed"
 fi
 
-# Install ONNX Runtime
+# Install ONNX Runtime (skip in OpenVINO mode)
+if [ "$USE_OPENVINO_MODE" = true ]; then
+    echo "ℹ️  Skipping ONNX Runtime installation (OpenVINO mode)"
+else
 echo "🧠 Setting up ONNX Runtime..."
 
 # Allow configurable installation path
@@ -439,6 +459,15 @@ else
 fi
 
 echo "💡 To install to a different location, set ONNX_INSTALL_PATH environment variable"
+
+fi  # end of OpenVINO mode skip for ONNX Runtime
+
+# ============================================================================
+# CUDA Section (skip entirely in OpenVINO mode)
+# ============================================================================
+if [ "$USE_OPENVINO_MODE" = true ]; then
+    echo "ℹ️  Skipping CUDA/TensorRT installation (OpenVINO mode)"
+else
 
 # Function to check for CUDA toolkit (nvcc compiler) - silent check
 check_cuda_toolkit() {
@@ -830,6 +859,8 @@ else
     fi
 fi
 
+fi  # end of OpenVINO mode skip for CUDA
+
 # Initialize Git LFS
 echo "📁 Setting up Git LFS..."
 if git lfs install --force 2>/dev/null; then
@@ -849,7 +880,17 @@ echo ""
 echo "🎉 System dependencies installation complete!"
 echo ""
 
-if [ "$IS_JETSON" = true ]; then
+if [ "$USE_OPENVINO_MODE" = true ]; then
+    echo "🔵 OpenVINO mode — next steps:"
+    echo "   1. Ensure OpenVINO is installed at /opt/intel/openvino_2026"
+    echo "   2. Run 'source scripts/setup_env.sh' to set up the environment"
+    echo "   3. Run 'just build' or 'cmake -DUSE_OPENVINO=ON' to build"
+    echo ""
+    echo "💡 Intel x86 tips:"
+    echo "   - OpenVINO uses Intel GPU (iGPU/dGPU) by default, CPU as fallback"
+    echo "   - No CUDA/TensorRT/NVIDIA drivers needed"
+    echo "   - ROS2 Jazzy is supported natively"
+elif [ "$IS_JETSON" = true ]; then
     echo "🤖 Jetson-specific setup completed!"
     echo ""
     echo "📋 Next steps for Jetson system:"
@@ -857,70 +898,42 @@ if [ "$IS_JETSON" = true ]; then
     echo "   2. Run 'source scripts/setup_env.sh' to configure paths for Jetson"
     echo "   3. Run 'just build' to build the project"
     echo ""
-    echo "💡 Jetson tips:"
-    echo "   - CUDA is typically pre-installed at /usr/local/cuda-12.6, /usr/local/cuda-11.4 or /usr/local/cuda-10.2"
-    echo "   - TensorRT is usually available at /usr/lib/aarch64-linux-gnu/"
-    echo "   - If build fails, you may need to install JetPack SDK development components"
-    echo "   - Monitor system temperature during compilation (use 'tegrastats')"
-    echo "   - For CUDA 12.6 systems, ensure you have the latest JetPack SDK Manager"
-    echo ""
-    
+
     # Install JetPack for Jetson systems (includes all DLA libraries)
     echo "🔧 Installing JetPack for complete Jetson development environment..."
-    
+
     update_package_cache
-    
+
     if sudo apt install -y nvidia-jetpack; then
         echo "✅ JetPack installed successfully - includes all DLA libraries!"
-        echo "   This resolves all TensorRT DLA dependencies"
     else
         echo "⚠️  JetPack installation failed (may have version conflicts)"
-        echo "   💡 Try: sudo apt update && sudo apt install -y nvidia-jetpack"
-        echo "   🔄 If issues persist, build should still work with existing libraries"
     fi
 else
-    # Non-Jetson systems
+    # Non-Jetson, non-OpenVINO systems
     echo "📋 Next steps for $ARCH system:"
-echo "   1. Make sure TensorRT is installed and TensorRT_ROOT is set"
-echo "   2. Run 'source scripts/setup_env.sh' to set up the environment"
-echo "   3. Run 'just build' to build the project"
-echo ""
-    
-    if [[ "$ARCH" == "aarch64" ]]; then
-        echo "💡 ARM64 tips:"
-        echo "   - CUDA may be installed at /usr/local/cuda or system locations"
-        echo "   - TensorRT typically installed via package manager"
-        echo "   - DLA libraries not needed on non-Jetson ARM64 systems"
-    elif [[ "$ARCH" == "x86_64" ]]; then
-        echo "💡 x86_64 tips:"
-        echo "   - CUDA typically at /usr/local/cuda or via CUDA toolkit"
-        echo "   - TensorRT available from NVIDIA or package repositories"
-        echo "   - Use nvidia-smi to check GPU compatibility"
-        echo "   - DLA libraries typically not needed on desktop GPUs"
-    fi
+    echo "   1. Make sure TensorRT is installed and TensorRT_ROOT is set"
+    echo "   2. Run 'source scripts/setup_env.sh' to set up the environment"
+    echo "   3. Run 'just build' to build the project"
 fi
 
 echo ""
 echo "⚠️  If you encounter any issues:"
-if [ "$IS_JETSON" = true ]; then
+if [ "$USE_OPENVINO_MODE" = true ]; then
+    echo "   🔵 OpenVINO troubleshooting:"
+    echo "   - Verify: source /opt/intel/openvino_2026/setupvars.sh"
+    echo "   - Check GPU: clinfo (for Intel GPU)"
+    echo "   - Check environment: echo \$USE_OPENVINO"
+elif [ "$IS_JETSON" = true ]; then
     echo "   🤖 Jetson-specific troubleshooting:"
     echo "   - Check JetPack version: jetson_release"
     echo "   - Verify CUDA installation: ls -la /usr/local/cuda*"
-    echo "   - Monitor resources: tegrastats"
     echo "   - For DLA linking errors: Install full JetPack SDK"
-    echo "   - For help: https://developer.nvidia.com/embedded/jetpack"
-elif [[ "$ARCH" == "aarch64" ]]; then
-    echo "   🔧 ARM64 troubleshooting:"
-    echo "   - Check CUDA: ls -la /usr/local/cuda*"
-    echo "   - Verify libraries: ldconfig -p | grep cuda"
-    echo "   - DLA errors: DLA not supported on non-Jetson ARM64"
 elif [[ "$ARCH" == "x86_64" ]]; then
     echo "   🖥️  x86_64 troubleshooting:"
     echo "   - Check GPU: nvidia-smi"
     echo "   - Verify CUDA: nvcc --version"
     echo "   - Check environment: echo \$CUDA_HOME \$TensorRT_ROOT"
-    echo "   - DLA errors: DLA typically not supported on desktop GPUs"
 else
     echo "   - Check that all environment variables are set correctly"
-    echo "   - Verify CUDA installation for your architecture"
 fi
