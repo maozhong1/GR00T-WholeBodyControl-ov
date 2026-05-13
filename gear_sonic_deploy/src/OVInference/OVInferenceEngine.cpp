@@ -14,6 +14,33 @@
 #include <algorithm>
 #include <numeric>
 #include <cassert>
+#include <filesystem>
+#include <cstdlib>
+
+// ============================================================================
+// Helper: Determine model cache directory
+// ============================================================================
+// Priority: $OV_CACHE_DIR > $HOME/.cache/openvino_model_cache > /tmp/openvino_model_cache
+static std::string GetCacheDir() {
+    // Check environment variable override
+    const char* env_cache = std::getenv("OV_CACHE_DIR");
+    if (env_cache && env_cache[0] != '\0') {
+        std::filesystem::create_directories(env_cache);
+        return env_cache;
+    }
+
+    // Default: ~/.cache/openvino_model_cache
+    const char* home = std::getenv("HOME");
+    std::string cache_dir;
+    if (home && home[0] != '\0') {
+        cache_dir = std::string(home) + "/.cache/openvino_model_cache";
+    } else {
+        cache_dir = "/tmp/openvino_model_cache";
+    }
+
+    std::filesystem::create_directories(cache_dir);
+    return cache_dir;
+}
 
 // ============================================================================
 // Implementation (pimpl)
@@ -86,6 +113,13 @@ bool OVInferenceEngine::Initialize(const std::string& modelPath, const std::stri
         for (const auto& d : devices) std::cout << " " << d;
         std::cout << std::endl;
 
+        // Enable model caching for faster subsequent loads (GPU/NPU compilation is cached on disk)
+        std::string cache_dir = GetCacheDir();
+        if (!cache_dir.empty()) {
+            m_impl->core.set_property(ov::cache_dir(cache_dir));
+            std::cout << "[OVInference] Model cache dir: " << cache_dir << std::endl;
+        }
+
         // Read model (supports ONNX natively)
         m_impl->model = m_impl->core.read_model(modelPath);
 
@@ -99,7 +133,7 @@ bool OVInferenceEngine::Initialize(const std::string& modelPath, const std::stri
         // Latency-optimized for real-time control
         config[ov::hint::performance_mode.name()] = ov::hint::PerformanceMode::LATENCY;
 
-        // Compile model
+        // Compile model (uses cache if available, otherwise compiles and stores to cache)
         m_impl->compiled_model = m_impl->core.compile_model(m_impl->model, device, config);
         m_impl->device_used = device;
 

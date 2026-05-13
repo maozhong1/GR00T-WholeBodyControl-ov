@@ -1,10 +1,9 @@
 /**
  * @file control_policy.hpp
- * @brief TensorRT-accelerated control-policy engine (observations → actions).
+ * @brief OpenVINO-accelerated control-policy engine (observations → actions).
  *
- * PolicyEngine loads an ONNX policy model, converts it to TensorRT at first
- * run (cached on disk), and provides GPU-accelerated inference with optional
- * CUDA graph capture for deterministic, sub-millisecond latency.
+ * PolicyEngine loads an ONNX policy model and runs inference via OpenVINO
+ * on Intel GPU, NPU, or CPU.
  *
  * ## I/O Contract
  *
@@ -13,11 +12,9 @@
  *
  * ## Typical Usage
  *
- *   1. `Initialize(model_path)` – convert + load the TRT engine.
+ *   1. `Initialize(model_path)` – load and compile the model.
  *   2. Fill `GetInputBuffer()` with observation data.
- *   3. `Infer()` – runs GPU inference and populates `GetActionBuffer()`.
- *   4. (Optional) `CaptureGraph()` after the first successful `Infer()` to
- *      lock the CUDA graph for all subsequent calls.
+ *   3. `Infer()` – runs inference and populates `GetActionBuffer()`.
  */
 
 #ifndef POLICY_ENGINE_HPP
@@ -31,15 +28,15 @@
 #include <iostream>
 #include <algorithm>
 #include <numeric>
+#include <chrono>
 #include "inference_backend.hpp"
 #include "robot_parameters.hpp"
 
 /**
  * @class PolicyEngine
- * @brief Runs the main RL control policy on GPU via TensorRT.
+ * @brief Runs the main RL control policy via OpenVINO on Intel GPU/NPU/CPU.
  *
- * Owns CUDA resources (stream, graph, graph-exec) and pinned-memory I/O
- * buffers.  Non-copyable; destroyed via `Destroy()` or the destructor.
+ * Non-copyable; destroyed via `Destroy()` or the destructor.
  */
 class PolicyEngine {
 public:
@@ -48,11 +45,13 @@ public:
 
   /**
    * @brief Initialize the control policy from a model path
-   * @param model_path Path to ONNX model file (will be converted to TensorRT)
+   * @param model_path Path to ONNX model file
    * @param use_fp16 Whether to use FP16 precision
+   * @param device OpenVINO device string ("GPU", "CPU", "NPU", "AUTO:GPU,CPU")
    * @return true if initialization successful, false otherwise
    */
-  bool Initialize(const std::string& model_path, bool use_fp16 = false) {
+  bool Initialize(const std::string& model_path, bool use_fp16 = false,
+                  const std::string& device = "GPU") {
     if (model_path.empty()) {
       std::cerr << "✗ PolicyEngine::Initialize - Empty model path" << std::endl;
       return false;
@@ -60,41 +59,49 @@ public:
 
     config_.model_path = model_path;
     config_.use_fp16 = use_fp16;
+    config_.device = device;
 
     try {
       std::cout << "Loading policy model..." << std::endl;
+      std::cout << "[Policy] Device: " << device
+                << " | Precision: " << (use_fp16 ? "FP16" : "FP32") << std::endl;
 
       inference_engine_ = std::make_unique<TRTInferenceEngine>();
 
-      // Setup options for ONNX to TensorRT conversion
       Options options;
       options.deviceID = config_.device_id;
       std::string prefix("policy_");
-      if (use_fp16) { 
-        options.precision = Precision::FP16; 
-        prefix += "fp16_"; 
+      if (use_fp16) {
+        options.precision = Precision::FP16;
+        prefix += "fp16_";
       }
 
-      std::string cached_trt_file;
-      if (!ConvertONNXToTRT(options, model_path, cached_trt_file, prefix, false)) {
-        std::cerr << "✗ Failed to convert policy ONNX to TRT: " << model_path << std::endl;
+      std::string model_file;
+      if (!ConvertONNXToTRT(options, model_path, model_file, prefix, false)) {
+        std::cerr << "✗ Failed to prepare policy model: " << model_path << std::endl;
         inference_engine_.reset();
         return false;
       }
 
-      if (!inference_engine_->Initialize(cached_trt_file, options.deviceID, options.dynamic_axes_names)) {
-        std::cerr << "✗ Failed to initialize policy TensorRT model: " << cached_trt_file << std::endl;
+      // Initialize with device selection
+      auto init_start = std::chrono::steady_clock::now();
+      if (!inference_engine_->Initialize(model_file, device,
+              use_fp16 ? Precision::FP16 : Precision::FP32)) {
+        std::cerr << "✗ Failed to initialize policy on " << device << ": " << model_file << std::endl;
         inference_engine_.reset();
         return false;
       }
+      auto init_end = std::chrono::steady_clock::now();
+      auto init_ms = std::chrono::duration_cast<std::chrono::milliseconds>(init_end - init_start).count();
+      std::cout << "[Policy] ✓ OpenVINO initialization took " << init_ms << "ms" << std::endl;
 
       if (!inference_engine_->InitInputs({})) {
-        std::cerr << "✗ Failed to initialize policy TensorRT model inputs" << std::endl;
+        std::cerr << "✗ Failed to initialize policy model inputs" << std::endl;
         inference_engine_.reset();
         return false;
       }
 
-      std::cout << "✓ Successfully converted ONNX to TRT: " << cached_trt_file << std::endl;
+      std::cout << "✓ Successfully loaded policy model: " << model_file << std::endl;
 
       // Validate required inputs
       auto input_names = inference_engine_->GetInputTensorNames();
@@ -122,12 +129,12 @@ public:
       // Initialize input buffer
       std::vector<int64_t> input_dims;
       inference_engine_->GetTensorShape(input_tensor_name_, input_dims);
-      
+
       config_.input_dimension = std::accumulate(
         input_dims.begin(), input_dims.end(), static_cast<size_t>(1), std::multiplies<size_t>()
       );
       policy_input_buffer_.resize(config_.input_dimension, 0.0f);
-      
+
       // Set initial input data (zeros)
       inference_engine_->SetInputData(input_tensor_name_, policy_input_buffer_);
 
@@ -164,7 +171,7 @@ public:
 
       // Validate action dimension matches robot configuration
       if (config_.action_dimension != G1_NUM_MOTOR) {
-        std::cerr << "✗ Policy action dimension (" << config_.action_dimension 
+        std::cerr << "✗ Policy action dimension (" << config_.action_dimension
                   << ") doesn't match G1 robot motors (" << G1_NUM_MOTOR << ")" << std::endl;
         inference_engine_.reset();
         return false;
@@ -172,17 +179,20 @@ public:
 
       action_buffer_.resize(config_.action_dimension, 0.0f);
 
-      // Create CUDA stream
-      cudaError_t cuda_status = cudaStreamCreate(&cuda_stream_);
-      if (cuda_status != cudaSuccess) {
-        std::cerr << "✗ Failed to create CUDA stream: " << cudaGetErrorString(cuda_status) << std::endl;
-        inference_engine_.reset();
-        return false;
+      // Run warmup inference
+      std::cout << "[Policy] Running warmup inference..." << std::endl;
+      auto warmup_start = std::chrono::steady_clock::now();
+      if (!inference_engine_->Enqueue(nullptr)) {
+        std::cout << "[Policy] ⚠ Warmup inference failed (non-fatal)" << std::endl;
       }
+      auto warmup_end = std::chrono::steady_clock::now();
+      auto warmup_ms = std::chrono::duration_cast<std::chrono::milliseconds>(warmup_end - warmup_start).count();
+      std::cout << "[Policy] ✓ Warmup inference took " << warmup_ms << "ms" << std::endl;
 
       initialized_ = true;
       std::cout << "✓ Policy engine initialized successfully!" << std::endl;
       std::cout << "  Model: " << model_path << std::endl;
+      std::cout << "  Device: " << device << std::endl;
       std::cout << "  Input dimension: " << config_.input_dimension << std::endl;
       std::cout << "  Action dimension: " << config_.action_dimension << std::endl;
       std::cout << "  Input tensor: " << input_tensor_name_ << std::endl;
@@ -209,115 +219,43 @@ public:
   }
 
   /**
-   * @brief Set input data asynchronously
-   * @param data Input data buffer
-   * @param element_count Number of elements
-   * @param stream CUDA stream for async operation
+   * @brief Set input data using std::vector
+   * @param data Input data vector
    */
   template<typename T>
-  void SetInputDataAsync(const T* data, size_t element_count, cudaStream_t stream) {
-    if (!initialized_ || !inference_engine_) { return; }
-    inference_engine_->SetInputDataAsync(input_tensor_name_, data, element_count, stream);
-  }
-
-  /**
-   * @brief Set input data using TPinnedVector
-   * @param data Input data in TPinnedVector
-   */
-  template<typename T>
-  void SetInputData(const TPinnedVector<T>& data) {
+  void SetInputData(const std::vector<T>& data) {
     if (!initialized_ || !inference_engine_) { return; }
     inference_engine_->SetInputData(input_tensor_name_, data);
   }
 
   /**
    * @brief Run control policy inference and populate internal action buffer
-   * @param stream CUDA stream for inference (uses internal stream if nullptr)
    * @return true if inference successful, false otherwise
    */
-  bool Infer(cudaStream_t stream = nullptr) {
-    if (!initialized_) { 
-      std::cerr << "✗ PolicyEngine::Infer - Not initialized" << std::endl; 
-      return false; 
+  bool Infer() {
+    if (!initialized_) {
+      std::cerr << "✗ PolicyEngine::Infer - Not initialized" << std::endl;
+      return false;
     }
-    if (!inference_engine_) { 
-      std::cerr << "✗ PolicyEngine::Infer - TensorRT engine not initialized" << std::endl; 
-      return false; 
+    if (!inference_engine_) {
+      std::cerr << "✗ PolicyEngine::Infer - Engine not initialized" << std::endl;
+      return false;
     }
 
-    cudaStream_t infer_stream = (stream != nullptr) ? stream : cuda_stream_;
-
-    // Transfer input data from CPU to GPU
+    // Transfer input data
     inference_engine_->SetInputData(input_tensor_name_, policy_input_buffer_);
 
-    if (graph_captured_ && cuda_graph_exec_ != nullptr) {
-      cudaError_t status = cudaGraphLaunch(cuda_graph_exec_, infer_stream);
-      if (status != cudaSuccess) {
-        std::cerr << "✗ PolicyEngine::Infer - Failed to launch CUDA graph: " << cudaGetErrorString(status) << std::endl;
-        return false;
-      }
-    } else {
-      if (!inference_engine_->Enqueue(infer_stream)) {
-        std::cerr << "✗ PolicyEngine::Infer - Failed to enqueue inference" << std::endl;
-        return false;
-      }
-    }
-    
-    // Automatically populate internal action buffer after inference (GPU to CPU)
-    inference_engine_->GetOutputDataAsync(output_tensor_name_, action_buffer_, infer_stream);
-    cudaStreamSynchronize(infer_stream);
-    
-    return true;
-  }
-
-  /**
-   * @brief Capture CUDA graph for optimized execution
-   * @return true if capture successful, false otherwise
-   */
-  bool CaptureGraph() {
-    if (!initialized_ || !inference_engine_) {
-      std::cerr << "✗ PolicyEngine::CaptureGraph - Cannot capture (engine not initialized)" << std::endl;
+    // Run inference
+    if (!inference_engine_->Enqueue(nullptr)) {
+      std::cerr << "✗ PolicyEngine::Infer - Inference failed" << std::endl;
       return false;
     }
-    if (graph_captured_) { 
-      std::cout << "Control policy CUDA graph already captured" << std::endl;
-      return true; 
-    }
 
-    std::cout << "Capturing control policy CUDA graph..." << std::endl;
-    cudaStreamBeginCapture(cuda_stream_, cudaStreamCaptureModeRelaxed);
-    if (!inference_engine_->Enqueue(cuda_stream_)) {
-      std::cerr << "✗ Failed to enqueue control policy inference for CUDA graph capture" << std::endl;
-      cudaStreamEndCapture(cuda_stream_, &cuda_graph_);
-      return false;
-    }
-    cudaStreamEndCapture(cuda_stream_, &cuda_graph_);
-    cudaStreamSynchronize(cuda_stream_);
-    
-    cudaGraphInstantiate(&cuda_graph_exec_, cuda_graph_, NULL, NULL, 0);
-    
-    graph_captured_ = true;
-    std::cout << "✓ Control policy CUDA graph captured successfully!" << std::endl;
+    // Read output
+    inference_engine_->GetOutputData(output_tensor_name_, action_buffer_);
+
     return true;
   }
-
-  /**
-   * @brief Get CUDA stream used by control policy
-   * @return CUDA stream handle
-   */
-  cudaStream_t GetCudaStream() const { return cuda_stream_; }
-
-  /**
-   * @brief Get CUDA graph (if captured)
-   * @return CUDA graph handle
-   */
-  cudaGraph_t GetCudaGraph() const { return cuda_graph_; }
-
-  /**
-   * @brief Get CUDA graph execution instance
-   * @return CUDA graph execution handle
-   */
-  cudaGraphExec_t GetCudaGraphExec() const { return cuda_graph_exec_; }
 
   /**
    * @brief Get input dimension
@@ -359,13 +297,13 @@ public:
    * @brief Get reference to internal input buffer
    * @return Reference to input buffer
    */
-  TPinnedVector<float>& GetInputBuffer() { return policy_input_buffer_; }
+  std::vector<float>& GetInputBuffer() { return policy_input_buffer_; }
 
   /**
    * @brief Get reference to internal action buffer
    * @return Reference to action buffer
    */
-  TPinnedVector<float>& GetActionBuffer() { return action_buffer_; }
+  std::vector<float>& GetActionBuffer() { return action_buffer_; }
 
   /**
    * @brief Get input tensor name
@@ -384,30 +322,17 @@ public:
    */
   void Destroy() {
     if (!initialized_) { return; }
-    if (cuda_graph_exec_ != nullptr) { 
-      cudaGraphExecDestroy(cuda_graph_exec_); 
-      cuda_graph_exec_ = nullptr; 
+    if (inference_engine_) {
+      inference_engine_->Destroy();
+      inference_engine_.reset();
     }
-    if (cuda_graph_ != nullptr) { 
-      cudaGraphDestroy(cuda_graph_); 
-      cuda_graph_ = nullptr; 
-    }
-    if (cuda_stream_ != nullptr) { 
-      cudaStreamDestroy(cuda_stream_); 
-      cuda_stream_ = nullptr; 
-    }
-    if (inference_engine_) { 
-      inference_engine_->Destroy(); 
-      inference_engine_.reset(); 
-    }
-    graph_captured_ = false; 
     initialized_ = false;
   }
 
 private:
-  // Internal configuration state
   struct Config {
     std::string model_path;
+    std::string device = "GPU";
     int device_id = 0;
     size_t input_dimension = 0;
     size_t action_dimension = 0;
@@ -415,28 +340,15 @@ private:
   };
   Config config_;
 
-  // TensorRT inference engine
   std::unique_ptr<TRTInferenceEngine> inference_engine_;
 
-  // Tensor names
   std::string input_tensor_name_;
   std::string output_tensor_name_;
 
-  // CUDA resources
-  cudaStream_t cuda_stream_ = nullptr;
-  cudaGraph_t cuda_graph_ = nullptr;
-  cudaGraphExec_t cuda_graph_exec_ = nullptr;
+  std::vector<float> policy_input_buffer_;
+  std::vector<float> action_buffer_;
 
-  // Input buffer
-  TPinnedVector<float> policy_input_buffer_;
-
-  // Action output buffer
-  TPinnedVector<float> action_buffer_;
-
-  // State
   bool initialized_ = false;
-  bool graph_captured_ = false;
 };
 
 #endif // POLICY_ENGINE_HPP
-

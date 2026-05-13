@@ -1,9 +1,9 @@
 /**
  * @file encoder.hpp
- * @brief TensorRT-accelerated encoder engine (observations → token state).
+ * @brief OpenVINO-accelerated encoder engine (observations → token state).
  *
- * EncoderEngine loads an ONNX encoder model, converts it to TensorRT, and
- * provides GPU-accelerated inference with optional CUDA graph capture.
+ * EncoderEngine loads an ONNX encoder model and runs inference via OpenVINO
+ * on Intel GPU, NPU, or CPU.
  *
  * The encoder compresses high-dimensional robot observations into a compact
  * latent / token representation that is then consumed by the control policy
@@ -23,10 +23,9 @@
  *
  * ## Typical Usage
  *
- *   1. `Initialize(model_path)` – convert + load TRT engine.
+ *   1. `Initialize(model_path)` – load and compile the model with OpenVINO.
  *   2. Fill `GetInputBuffer()` with encoder observations.
- *   3. `Encode()` – runs GPU inference and populates `GetTokenBuffer()`.
- *   4. (Optional) `CaptureGraph()` for deterministic latency.
+ *   3. `Encode()` – runs inference and populates `GetTokenBuffer()`.
  */
 
 #ifndef ENCODER_HPP
@@ -39,14 +38,14 @@
 #include <iostream>
 #include <algorithm>
 #include <numeric>
+#include <chrono>
 #include "inference_backend.hpp"
 
 /**
  * @class EncoderEngine
- * @brief Runs the observation encoder on GPU via TensorRT.
+ * @brief Runs the observation encoder via OpenVINO on Intel GPU/NPU/CPU.
  *
- * Mirrors the PolicyEngine architecture: owns CUDA resources, pinned-memory
- * buffers, and supports CUDA graph capture.  Non-copyable.
+ * Non-copyable. Owns the inference engine and I/O buffers.
  */
 class EncoderEngine {
 public:
@@ -55,11 +54,13 @@ public:
 
   /**
    * @brief Initialize the encoder engine from a model path
-   * @param model_path Path to ONNX model file (will be converted to TensorRT)
+   * @param model_path Path to ONNX model file
    * @param use_fp16 Whether to use FP16 precision
+   * @param device OpenVINO device string ("GPU", "CPU", "NPU", "AUTO:GPU,CPU")
    * @return true if initialization successful, false otherwise
    */
-  bool Initialize(const std::string& model_path, bool use_fp16 = false) {
+  bool Initialize(const std::string& model_path, bool use_fp16 = false,
+                  const std::string& device = "GPU") {
     if (model_path.empty()) {
       std::cerr << "✗ EncoderEngine::Initialize - Empty model path" << std::endl;
       return false;
@@ -67,9 +68,12 @@ public:
 
     config_.model_path = model_path;
     config_.use_fp16 = use_fp16;
+    config_.device = device;
 
     try {
       std::cout << "Loading encoder model..." << std::endl;
+      std::cout << "[Encoder] Device: " << device
+                << " | Precision: " << (use_fp16 ? "FP16" : "FP32") << std::endl;
 
       inference_engine_ = std::make_unique<TRTInferenceEngine>();
 
@@ -78,21 +82,27 @@ public:
       std::string prefix("encoder_");
       if (use_fp16) { options.precision = Precision::FP16; prefix += "fp16_"; }
 
-      std::string cached_trt_file;
-      if (!ConvertONNXToTRT(options, model_path, cached_trt_file, prefix, false)) {
-        std::cerr << "✗ Failed to convert encoder ONNX to TRT: " << model_path << std::endl;
+      std::string model_file;
+      if (!ConvertONNXToTRT(options, model_path, model_file, prefix, false)) {
+        std::cerr << "✗ Failed to prepare encoder model: " << model_path << std::endl;
         inference_engine_.reset();
         return false;
       }
 
-      if (!inference_engine_->Initialize(cached_trt_file, options.deviceID, options.dynamic_axes_names)) {
-        std::cerr << "✗ Failed to initialize encoder TensorRT model: " << cached_trt_file << std::endl;
+      // Initialize with device selection
+      auto init_start = std::chrono::steady_clock::now();
+      if (!inference_engine_->Initialize(model_file, device,
+              use_fp16 ? Precision::FP16 : Precision::FP32)) {
+        std::cerr << "✗ Failed to initialize encoder on " << device << ": " << model_file << std::endl;
         inference_engine_.reset();
         return false;
       }
+      auto init_end = std::chrono::steady_clock::now();
+      auto init_ms = std::chrono::duration_cast<std::chrono::milliseconds>(init_end - init_start).count();
+      std::cout << "[Encoder] ✓ OpenVINO initialization took " << init_ms << "ms" << std::endl;
 
       if (!inference_engine_->InitInputs({})) {
-        std::cerr << "✗ Failed to initialize encoder TensorRT model inputs" << std::endl;
+        std::cerr << "✗ Failed to initialize encoder model inputs" << std::endl;
         inference_engine_.reset();
         return false;
       }
@@ -160,25 +170,29 @@ public:
         inference_engine_.reset();
         return false;
       }
-      
+
       config_.input_dimension = std::accumulate(
         input_dims.begin(), input_dims.end(), static_cast<size_t>(1), std::multiplies<size_t>()
       );
       encoder_input_buffer_.resize(config_.input_dimension, 0.0f);
-      
+
       // Set initial input data (zeros)
       inference_engine_->SetInputData(input_tensor_name_, encoder_input_buffer_);
 
-      cudaError_t cuda_status = cudaStreamCreate(&cuda_stream_);
-      if (cuda_status != cudaSuccess) {
-        std::cerr << "✗ Failed to create CUDA stream: " << cudaGetErrorString(cuda_status) << std::endl;
-        inference_engine_.reset();
-        return false;
+      // Run warmup inference
+      std::cout << "[Encoder] Running warmup inference..." << std::endl;
+      auto warmup_start = std::chrono::steady_clock::now();
+      if (!inference_engine_->Enqueue(nullptr)) {
+        std::cout << "[Encoder] ⚠ Warmup inference failed (non-fatal)" << std::endl;
       }
+      auto warmup_end = std::chrono::steady_clock::now();
+      auto warmup_ms = std::chrono::duration_cast<std::chrono::milliseconds>(warmup_end - warmup_start).count();
+      std::cout << "[Encoder] ✓ Warmup inference took " << warmup_ms << "ms" << std::endl;
 
       initialized_ = true;
       std::cout << "✓ Encoder initialized successfully!" << std::endl;
       std::cout << "  Model: " << model_path << std::endl;
+      std::cout << "  Device: " << device << std::endl;
       std::cout << "  Input dimension: " << config_.input_dimension << std::endl;
       std::cout << "  Token dimension: " << config_.token_dimension << std::endl;
       std::cout << "  Input tensor: " << input_tensor_name_ << std::endl;
@@ -205,109 +219,37 @@ public:
   }
 
   /**
-   * @brief Set input data asynchronously
-   * @param data Input data buffer
-   * @param element_count Number of elements
-   * @param stream CUDA stream for async operation
+   * @brief Set input data using std::vector
+   * @param data Input data vector
    */
   template<typename T>
-  void SetInputDataAsync(const T* data, size_t element_count, cudaStream_t stream) {
-    if (!initialized_ || !inference_engine_) { return; }
-    inference_engine_->SetInputDataAsync(input_tensor_name_, data, element_count, stream);
-  }
-
-  /**
-   * @brief Set input data using TPinnedVector
-   * @param data Input data in TPinnedVector
-   */
-  template<typename T>
-  void SetInputData(const TPinnedVector<T>& data) {
+  void SetInputData(const std::vector<T>& data) {
     if (!initialized_ || !inference_engine_) { return; }
     inference_engine_->SetInputData(input_tensor_name_, data);
   }
 
   /**
    * @brief Run encoder inference and populate internal token buffer
-   * @param stream CUDA stream for inference (uses internal stream if nullptr)
    * @return true if inference successful, false otherwise
    */
-  bool Encode(cudaStream_t stream = nullptr) {
+  bool Encode() {
     if (!initialized_) { std::cerr << "✗ EncoderEngine::Encode - Not initialized" << std::endl; return false; }
-    if (!inference_engine_) { std::cerr << "✗ EncoderEngine::Encode - TensorRT engine not initialized" << std::endl; return false; }
+    if (!inference_engine_) { std::cerr << "✗ EncoderEngine::Encode - Engine not initialized" << std::endl; return false; }
 
-    cudaStream_t encode_stream = (stream != nullptr) ? stream : cuda_stream_;
-
-    // Transfer input data from CPU to GPU
+    // Transfer input data
     inference_engine_->SetInputData(input_tensor_name_, encoder_input_buffer_);
 
-    if (graph_captured_ && cuda_graph_exec_ != nullptr) {
-      cudaError_t status = cudaGraphLaunch(cuda_graph_exec_, encode_stream);
-      if (status != cudaSuccess) {
-        std::cerr << "✗ EncoderEngine::Encode - Failed to launch CUDA graph: " << cudaGetErrorString(status) << std::endl;
-        return false;
-      }
-    } else {
-      if (!inference_engine_->Enqueue(encode_stream)) {
-        std::cerr << "✗ EncoderEngine::Encode - Failed to enqueue inference" << std::endl;
-        return false;
-      }
-    }
-    
-    // Automatically populate internal token buffer after inference (GPU to CPU)
-    inference_engine_->GetOutputDataAsync(output_tensor_name_, token_buffer_, encode_stream);
-    cudaStreamSynchronize(encode_stream);
-    
-    return true;
-  }
-
-  /**
-   * @brief Capture CUDA graph for optimized execution
-   * @return true if capture successful, false otherwise
-   */
-  bool CaptureGraph() {
-    if (!initialized_ || !inference_engine_) {
-      std::cerr << "✗ EncoderEngine::CaptureGraph - Cannot capture (engine not initialized)" << std::endl;
+    // Run inference
+    if (!inference_engine_->Enqueue(nullptr)) {
+      std::cerr << "✗ EncoderEngine::Encode - Inference failed" << std::endl;
       return false;
     }
-    if (graph_captured_) { 
-      std::cout << "Encoder CUDA graph already captured" << std::endl;
-      return true; 
-    }
 
-    std::cout << "Capturing encoder CUDA graph..." << std::endl;
-    cudaStreamBeginCapture(cuda_stream_, cudaStreamCaptureModeRelaxed);
-    if (!inference_engine_->Enqueue(cuda_stream_)) {
-      std::cerr << "✗ Failed to enqueue encoder inference for CUDA graph capture" << std::endl;
-      cudaStreamEndCapture(cuda_stream_, &cuda_graph_);
-      return false;
-    }
-    cudaStreamEndCapture(cuda_stream_, &cuda_graph_);
-    cudaStreamSynchronize(cuda_stream_);
-    
-    cudaGraphInstantiate(&cuda_graph_exec_, cuda_graph_, NULL, NULL, 0);
-    
-    graph_captured_ = true;
-    std::cout << "✓ Encoder CUDA graph captured successfully!" << std::endl;
+    // Read output
+    inference_engine_->GetOutputData(output_tensor_name_, token_buffer_);
+
     return true;
   }
-
-  /**
-   * @brief Get CUDA stream used by encoder
-   * @return CUDA stream handle
-   */
-  cudaStream_t GetCudaStream() const { return cuda_stream_; }
-
-  /**
-   * @brief Get CUDA graph (if captured)
-   * @return CUDA graph handle
-   */
-  cudaGraph_t GetCudaGraph() const { return cuda_graph_; }
-
-  /**
-   * @brief Get CUDA graph execution instance
-   * @return CUDA graph execution handle
-   */
-  cudaGraphExec_t GetCudaGraphExec() const { return cuda_graph_exec_; }
 
   /**
    * @brief Get input dimension
@@ -320,18 +262,6 @@ public:
    * @return Token dimension size
    */
   size_t GetTokenDimension() const { return config_.token_dimension; }
-
-  /**
-   * @brief Get current token source type
-   * @return Token source type
-   */
-  // EncoderTokenSource GetTokenSource() const { return config_.source; } // Removed
-
-  /**
-   * @brief Set token source type
-   * @param source Token source type
-   */
-  // void SetTokenSource(EncoderTokenSource source) { config_.source = source; } // Removed
 
   /**
    * @brief Check if encoder is initialized
@@ -355,30 +285,27 @@ public:
    * @brief Get reference to internal input buffer
    * @return Reference to input buffer
    */
-  TPinnedVector<float>& GetInputBuffer() { return encoder_input_buffer_; }
+  std::vector<float>& GetInputBuffer() { return encoder_input_buffer_; }
 
   /**
    * @brief Get reference to internal token buffer
    * @return Reference to token buffer
    */
-  TPinnedVector<float>& GetTokenBuffer() { return token_buffer_; }
+  std::vector<float>& GetTokenBuffer() { return token_buffer_; }
 
   /**
    * @brief Destroy and clean up encoder resources
    */
   void Destroy() {
     if (!initialized_) { return; }
-    if (cuda_graph_exec_ != nullptr) { cudaGraphExecDestroy(cuda_graph_exec_); cuda_graph_exec_ = nullptr; }
-    if (cuda_graph_ != nullptr) { cudaGraphDestroy(cuda_graph_); cuda_graph_ = nullptr; }
-    if (cuda_stream_ != nullptr) { cudaStreamDestroy(cuda_stream_); cuda_stream_ = nullptr; }
     if (inference_engine_) { inference_engine_->Destroy(); inference_engine_.reset(); }
-    graph_captured_ = false; initialized_ = false;
+    initialized_ = false;
   }
 
 private:
-  // Internal configuration state
   struct Config {
     std::string model_path;
+    std::string device = "GPU";
     int device_id = 0;
     size_t input_dimension = 0;
     size_t token_dimension = 0;
@@ -386,27 +313,15 @@ private:
   };
   Config config_;
 
-  // TensorRT inference engine
   std::unique_ptr<TRTInferenceEngine> inference_engine_;
 
-  // Tensor names
   std::string input_tensor_name_;
   std::string output_tensor_name_;
 
-  // CUDA resources
-  cudaStream_t cuda_stream_ = nullptr;
-  cudaGraph_t cuda_graph_ = nullptr;
-  cudaGraphExec_t cuda_graph_exec_ = nullptr;
+  std::vector<float> encoder_input_buffer_;
+  std::vector<float> token_buffer_;
 
-  // Input buffer
-  TPinnedVector<float> encoder_input_buffer_;
-
-  // Token storage
-  TPinnedVector<float> token_buffer_;
-
-  // State
   bool initialized_ = false;
-  bool graph_captured_ = false;
 };
 
 #endif // ENCODER_HPP

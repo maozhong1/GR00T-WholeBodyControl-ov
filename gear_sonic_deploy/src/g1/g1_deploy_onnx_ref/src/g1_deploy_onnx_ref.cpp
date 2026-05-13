@@ -46,9 +46,6 @@
  *   --policy-fp16         | Use FP16 for policy TensorRT engine
  */
 #include <cmath>
-#ifndef USE_OPENVINO
-#include <cuda_runtime_api.h>
-#endif
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -125,9 +122,6 @@
 
 #include "../include/output_interface/zmq_output_handler.hpp"
 
-#ifndef USE_OPENVINO
-#include <cuda_runtime.h>
-#endif
 #include "../include/state_logger.hpp"
 
 // Encoder
@@ -2307,11 +2301,6 @@ class G1Deploy {
       size_t obs_dim = policy_engine_->GetInputDimension();
       obs_buffer_.resize(obs_dim, 0.0);
       
-      // Capture CUDA graph for optimized execution
-      if (!policy_engine_->CaptureGraph()) {
-        throw std::runtime_error("Failed to capture control policy CUDA graph");
-      }
-      
       std::cout << "✓ Policy model loaded successfully!" << std::endl;
 
       // Load observation configuration FIRST (before encoder/planner initialization)
@@ -2362,11 +2351,6 @@ class G1Deploy {
         size_t encoder_input_size = encoder_engine_->GetInputDimension();
         encoder_obs_buffer_.resize(encoder_input_size, 0.0);
 
-        // Capture CUDA graph for optimized execution
-        if (!encoder_engine_->CaptureGraph()) {
-          throw std::runtime_error("Failed to capture encoder CUDA graph");
-        }
-        
         std::cout << "✓ Encoder model loaded successfully!" << std::endl;
         is_using_encoder_ = true;
         initial_encoder_mode_ = 0;  // Encoder available, default to mode 0.
@@ -2416,7 +2400,8 @@ class G1Deploy {
           std::cout << "Unsupported planner version: " << planner_path << std::endl;
           throw std::runtime_error("Unsupported planner version: " + planner_path);
         }
-        planner_ = std::make_unique<LocalMotionPlannerTensorRT>(planner_fp16, 0, planner_config);
+        // Planner always uses FP32 for accuracy on CPU
+        planner_ = std::make_unique<LocalMotionPlannerTensorRT>(false, 0, planner_config);
       }
       
       // Initialize observation function map
