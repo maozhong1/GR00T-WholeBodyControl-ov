@@ -78,3 +78,8 @@ encoder:
         - smpl_joints_10frame_step1
         - smpl_anchor_orientation_10frame_step1
         - motion_joint_positions_wrists_10frame_step1
+
+inference:
+  encoder_device: "GPU"
+  policy_device: "GPU"
+  planner_device: "CPU"

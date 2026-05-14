@@ -95,7 +95,7 @@ OVInferenceEngine::~OVInferenceEngine() { Destroy(); }
 bool OVInferenceEngine::Initialize(const std::string& modelPath, int /*deviceID*/,
                                    const Options::AxisNames& /*axisNames*/) {
     // Use AUTO:NPU,CPU as default — OpenVINO will pick best available
-    return Initialize(modelPath, "AUTO:GPU,CPU", Precision::FP32);
+    return Initialize(modelPath, "AUTO:NPU,CPU", Precision::FP32);
 }
 
 // ============================================================================
@@ -124,9 +124,14 @@ bool OVInferenceEngine::Initialize(const std::string& modelPath, const std::stri
         m_impl->model = m_impl->core.read_model(modelPath);
 
         // Set precision hint
+        // NPU only supports FP16/INT8 — force FP16 if targeting NPU
         ov::AnyMap config;
-        if (precision == Precision::FP16) {
+        bool is_npu = (device == "NPU" || device.find("NPU") != std::string::npos);
+        if (precision == Precision::FP16 || is_npu) {
             config[ov::hint::inference_precision.name()] = ov::element::f16;
+            if (is_npu && precision != Precision::FP16) {
+                std::cout << "[OVInference] NPU does not support FP32, using FP16" << std::endl;
+            }
         } else {
             config[ov::hint::inference_precision.name()] = ov::element::f32;
         }

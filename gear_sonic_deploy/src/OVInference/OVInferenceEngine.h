@@ -57,8 +57,8 @@ struct Options {
     std::tuple<int, int, int> defaultSizes = {1, 8, 16};
     int              deviceID = 0;
 
-    // OpenVINO-specific: preferred device ("GPU", "CPU", "AUTO", "GPU.0", etc.)
-    std::string ov_device = "GPU";
+    // OpenVINO-specific: preferred device ("NPU", "GPU", "CPU", "AUTO:NPU,CPU", etc.)
+    std::string ov_device = "NPU";
     // Fallback device when preferred is unavailable
     std::string ov_fallback_device = "CPU";
 };

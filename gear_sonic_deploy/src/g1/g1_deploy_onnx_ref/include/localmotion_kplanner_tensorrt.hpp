@@ -166,13 +166,12 @@ private:
             return false;
         }
 
-        // Planner always runs on CPU with FP32 for accuracy
-        std::cout << "[Planner] Initializing with OpenVINO backend (CPU, FP32)..." << std::endl;
+        std::cout << "[Planner] Initializing with OpenVINO backend (" << config_.device << ", FP32)..." << std::endl;
         std::cout << "[Planner] Model: " << model_file << std::endl;
 
         auto init_start = std::chrono::steady_clock::now();
-        if (!inference_engine_->Initialize(model_file, "CPU", Precision::FP32)) {
-            std::cout << "✗ Failed to initialize planner on CPU: " << model_file << std::endl;
+        if (!inference_engine_->Initialize(model_file, config_.device, Precision::FP32)) {
+            std::cout << "✗ Failed to initialize planner on " << config_.device << ": " << model_file << std::endl;
             return false;
         }
         auto init_end = std::chrono::steady_clock::now();

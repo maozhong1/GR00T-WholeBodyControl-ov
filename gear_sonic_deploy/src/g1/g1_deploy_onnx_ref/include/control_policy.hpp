@@ -51,7 +51,7 @@ public:
    * @return true if initialization successful, false otherwise
    */
   bool Initialize(const std::string& model_path, bool use_fp16 = false,
-                  const std::string& device = "GPU") {
+                  const std::string& device = "NPU") {
     if (model_path.empty()) {
       std::cerr << "✗ PolicyEngine::Initialize - Empty model path" << std::endl;
       return false;

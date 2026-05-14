@@ -2292,20 +2292,8 @@ class G1Deploy {
         throw std::runtime_error("Failed to load motion data");
       }
       
-      // Initialize control policy
-      policy_engine_ = std::make_unique<PolicyEngine>();
-      
-      if (!policy_engine_->Initialize(model_path, policy_fp16)) {
-        throw std::runtime_error("Failed to initialize control policy from: " + model_path);
-      }
-      
-      // Initialize observation buffer with correct size (zero-initialized)
-      size_t obs_dim = policy_engine_->GetInputDimension();
-      obs_buffer_.resize(obs_dim, 0.0);
-      
-      std::cout << "✓ Policy model loaded successfully!" << std::endl;
-
-      // Load observation configuration FIRST (before encoder/planner initialization)
+      // Load observation configuration FIRST (before model initialization)
+      // This provides device settings for policy/encoder/planner
       std::cout << "Loading observation configuration..." << std::endl;
       FullObservationConfig full_obs_config;
       if (!obs_config_path.empty()) {
@@ -2315,14 +2303,28 @@ class G1Deploy {
         std::cout << "Using default observation configuration" << std::endl;
         full_obs_config.observations = ObservationConfigParser::ParseConfig();
       }
-      
+
       // Check if config parsing failed (empty observations returned)
       if (full_obs_config.observations.empty()) {
         throw std::runtime_error("Failed to parse observation configuration - check config file for errors");
       }
-      
+
       obs_config_ = full_obs_config.observations;
       encoder_config_ = full_obs_config.encoder;
+      InferenceConfig inference_config = full_obs_config.inference;
+
+      // Initialize control policy
+      policy_engine_ = std::make_unique<PolicyEngine>();
+
+      if (!policy_engine_->Initialize(model_path, policy_fp16, inference_config.policy_device)) {
+        throw std::runtime_error("Failed to initialize control policy from: " + model_path);
+      }
+
+      // Initialize observation buffer with correct size (zero-initialized)
+      size_t obs_dim = policy_engine_->GetInputDimension();
+      obs_buffer_.resize(obs_dim, 0.0);
+
+      std::cout << "✓ Policy model loaded successfully!" << std::endl;
       
       // Initialize token buffer size from encoder config
       if (encoder_config_.dimension > 0) {
@@ -2339,7 +2341,7 @@ class G1Deploy {
         std::cout << "Initializing encoder..." << std::endl;
         encoder_engine_ = std::make_unique<EncoderEngine>();
         
-        if (!encoder_engine_->Initialize(encoder_file_path, encoder_config_.use_fp16)) {
+        if (!encoder_engine_->Initialize(encoder_file_path, encoder_config_.use_fp16, inference_config.encoder_device)) {
           throw std::runtime_error("Failed to initialize encoder engine from: " + encoder_file_path);
         }
         
@@ -2402,7 +2404,7 @@ class G1Deploy {
           std::cout << "Unsupported planner version: " << planner_path << std::endl;
           throw std::runtime_error("Unsupported planner version: " + planner_path);
         }
-        // Planner always uses FP32 for accuracy on CPU
+        planner_config.device = inference_config.planner_device;
         planner_ = std::make_unique<LocalMotionPlannerTensorRT>(false, 0, planner_config);
       }
       

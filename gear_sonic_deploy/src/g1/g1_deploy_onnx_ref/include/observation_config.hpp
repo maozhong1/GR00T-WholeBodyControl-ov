@@ -91,11 +91,29 @@ struct EncoderConfig {
 };
 
 /**
+ * @brief Inference device configuration for all models.
+ *
+ * Configurable via the `inference:` section in observation_config.yaml:
+ * ```yaml
+ * inference:
+ *   encoder_device: "NPU"
+ *   policy_device: "NPU"
+ *   planner_device: "CPU"
+ * ```
+ */
+struct InferenceConfig {
+  std::string encoder_device = "NPU";   ///< OpenVINO device for encoder ("NPU", "GPU", "CPU")
+  std::string policy_device = "NPU";    ///< OpenVINO device for policy ("NPU", "GPU", "CPU")
+  std::string planner_device = "CPU";   ///< OpenVINO device for planner ("CPU" recommended)
+};
+
+/**
  * @brief Combined configuration containing observations and optional encoder
  */
 struct FullObservationConfig {
   std::vector<ObservationConfig> observations;
   EncoderConfig encoder;
+  InferenceConfig inference;
 };
 
 /**
@@ -135,6 +153,7 @@ public:
     std::string line;
     bool in_observations_section = false;
     bool in_encoder_section = false;
+    bool in_inference_section = false;
     bool in_encoder_observations_section = false;
     bool in_encoder_modes_section = false;
     bool in_mode_observations_section = false;
@@ -159,16 +178,45 @@ public:
       if (line.find("encoder:") == 0 || line == "encoder:") {
         in_observations_section = false;
         in_encoder_section = true;
+        in_inference_section = false;
         in_encoder_observations_section = false;
         std::cout << "Found encoder section at line " << line_number << std::endl;
         continue;
       }
-      
+
       if (line.find("observations:") == 0 || line == "observations:") {
         in_observations_section = true;
         in_encoder_section = false;
+        in_inference_section = false;
         in_encoder_observations_section = false;
         std::cout << "Found observations section at line " << line_number << std::endl;
+        continue;
+      }
+
+      if (line.find("inference:") == 0 || line == "inference:") {
+        in_observations_section = false;
+        in_encoder_section = false;
+        in_inference_section = true;
+        in_encoder_observations_section = false;
+        in_encoder_modes_section = false;
+        std::cout << "Found inference section at line " << line_number << std::endl;
+        continue;
+      }
+
+      // Parse inference section
+      if (in_inference_section) {
+        if (line.find("encoder_device:") != std::string::npos) {
+          full_config.inference.encoder_device = ExtractValue(line, "encoder_device:");
+          std::cout << "  Inference encoder_device: " << full_config.inference.encoder_device << std::endl;
+        }
+        else if (line.find("policy_device:") != std::string::npos) {
+          full_config.inference.policy_device = ExtractValue(line, "policy_device:");
+          std::cout << "  Inference policy_device: " << full_config.inference.policy_device << std::endl;
+        }
+        else if (line.find("planner_device:") != std::string::npos) {
+          full_config.inference.planner_device = ExtractValue(line, "planner_device:");
+          std::cout << "  Inference planner_device: " << full_config.inference.planner_device << std::endl;
+        }
         continue;
       }
       

@@ -211,6 +211,7 @@ inline std::vector<LocomotionMode> get_motion_set(int motion_set_index) {
  */
 struct PlannerConfig {
     std::string model_path = "";
+    std::string device = "CPU";            // OpenVINO device ("CPU", "NPU", "GPU")
     int version = 0;
     int motion_look_ahead_steps = 2;      // 50Hz: 0.02s * 2 = 0.04s
     double default_height = 0.788740;      // Default robot height
