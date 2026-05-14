@@ -80,6 +80,12 @@ encoder:
         - motion_joint_positions_wrists_10frame_step1
 
 inference:
-  encoder_device: "GPU"
-  policy_device: "GPU"
+  encoder_device: "NPU"
+  policy_device: "NPU"
   planner_device: "CPU"
+  # Pin the inference/control thread to a specific CPU core to reduce latency jitter.
+  # Set to -1 to disable pinning (default), or a core number (e.g., 10) to pin.
+  # Here 10 is one of isolated core, dedicated for inference.
+  # use 'echo 10 | sudo tee /proc/irq/189/smp_affinity_list' to set vpu interrupt affitiy
+  # to reduce jitter in case NPU sync inference.
+  cpu_affinity: 10

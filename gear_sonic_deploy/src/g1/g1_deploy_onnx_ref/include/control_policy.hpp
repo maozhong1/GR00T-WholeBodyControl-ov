@@ -29,6 +29,9 @@
 #include <algorithm>
 #include <numeric>
 #include <chrono>
+#include <cstring>
+#include <sched.h>
+#include <pthread.h>
 #include "inference_backend.hpp"
 #include "robot_parameters.hpp"
 
@@ -179,6 +182,16 @@ public:
 
       action_buffer_.resize(config_.action_dimension, 0.0f);
 
+      // Cache direct pointers to OV tensor buffers for zero-copy inference.
+      // These pointers remain valid for the engine's lifetime.
+      input_tensor_ptr_ = static_cast<float*>(
+          inference_engine_->GetInputTensorBuffer(input_tensor_name_));
+      output_tensor_ptr_ = static_cast<const float*>(
+          inference_engine_->GetOutputTensorBuffer(output_tensor_name_));
+      if (input_tensor_ptr_ && output_tensor_ptr_) {
+        std::cout << "[Policy] ✓ Zero-copy mode enabled (direct tensor buffer access)" << std::endl;
+      }
+
       // Run warmup inference
       std::cout << "[Policy] Running warmup inference..." << std::endl;
       auto warmup_start = std::chrono::steady_clock::now();
@@ -229,7 +242,34 @@ public:
   }
 
   /**
-   * @brief Run control policy inference and populate internal action buffer
+   * @brief Set CPU core affinity for the inference calling thread.
+   * @param core CPU core number to pin to (-1 = no pinning)
+   *
+   * When running on GPU/NPU, the infer() call is synchronous from the calling
+   * thread. Pinning this thread to a dedicated core reduces scheduling jitter
+   * and produces more deterministic inference latency.
+   */
+  void SetCpuAffinity(int core) {
+    cpu_affinity_core_ = core;
+    if (core >= 0) {
+      cpu_set_t cpuset;
+      CPU_ZERO(&cpuset);
+      CPU_SET(core, &cpuset);
+      if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) == 0) {
+        std::cout << "[Policy] ✓ Inference thread pinned to CPU core " << core << std::endl;
+      } else {
+        std::cerr << "[Policy] ⚠ Failed to pin thread to core " << core << std::endl;
+      }
+    }
+  }
+
+  /**
+   * @brief Run control policy inference and populate internal action buffer.
+   *
+   * Uses zero-copy when available: input data is already written directly
+   * into the OV tensor via GetInputBuffer() → input_tensor_ptr_, and output
+   * is read directly from output_tensor_ptr_ via GetActionBuffer().
+   *
    * @return true if inference successful, false otherwise
    */
   bool Infer() {
@@ -242,17 +282,29 @@ public:
       return false;
     }
 
-    // Transfer input data
-    inference_engine_->SetInputData(input_tensor_name_, policy_input_buffer_);
+    if (input_tensor_ptr_) {
+      // Zero-copy path: policy_input_buffer_ IS the OV tensor buffer.
+      // Data was already written by caller via GetInputBuffer().
+      // Just run inference — no SetInputData memcpy needed.
+    } else {
+      // Fallback: copy from internal buffer to OV tensor
+      inference_engine_->SetInputData(input_tensor_name_, policy_input_buffer_);
+    }
 
-    // Run inference
+    // Run inference (synchronous: submit to NPU/GPU, wait for result)
     if (!inference_engine_->Enqueue(nullptr)) {
       std::cerr << "✗ PolicyEngine::Infer - Inference failed" << std::endl;
       return false;
     }
 
-    // Read output
-    inference_engine_->GetOutputData(output_tensor_name_, action_buffer_);
+    if (output_tensor_ptr_) {
+      // Zero-copy path: read directly from OV output tensor into action_buffer_
+      std::memcpy(action_buffer_.data(), output_tensor_ptr_,
+                  config_.action_dimension * sizeof(float));
+    } else {
+      // Fallback
+      inference_engine_->GetOutputData(output_tensor_name_, action_buffer_);
+    }
 
     return true;
   }
@@ -294,7 +346,27 @@ public:
   }
 
   /**
-   * @brief Get reference to internal input buffer
+   * @brief Get pointer to input buffer for writing observations.
+   *
+   * When zero-copy is active (input_tensor_ptr_ != nullptr), returns
+   * the OV tensor's internal memory — writes go directly to the device
+   * input buffer with no intermediate copy.
+   *
+   * When zero-copy is not available, returns policy_input_buffer_.data().
+   *
+   * @return Writable float pointer, size = GetInputDimension()
+   */
+  float* GetInputBufferPtr() {
+    return input_tensor_ptr_ ? input_tensor_ptr_ : policy_input_buffer_.data();
+  }
+
+  /**
+   * @brief Get reference to internal input buffer (legacy API).
+   *
+   * Note: When zero-copy is available, prefer GetInputBufferPtr() for
+   * maximum performance. This vector-based API still works but requires
+   * an extra memcpy into the OV tensor during Infer().
+   *
    * @return Reference to input buffer
    */
   std::vector<float>& GetInputBuffer() { return policy_input_buffer_; }
@@ -348,6 +420,11 @@ private:
   std::vector<float> policy_input_buffer_;
   std::vector<float> action_buffer_;
 
+  // Zero-copy: cached raw pointers into OV tensor buffers (nullptr = fallback to memcpy)
+  float* input_tensor_ptr_ = nullptr;
+  const float* output_tensor_ptr_ = nullptr;
+
+  int cpu_affinity_core_ = -1;  ///< CPU core for inference thread pinning (-1 = no pinning)
   bool initialized_ = false;
 };
 

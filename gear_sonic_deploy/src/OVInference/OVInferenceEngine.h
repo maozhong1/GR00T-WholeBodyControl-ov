@@ -152,6 +152,29 @@ public:
     DataType GetTensorDataType(std::string name) const;
 
     /**
+     * @brief Get direct pointer to input tensor's memory buffer (zero-copy).
+     *
+     * Write observation data directly into this buffer to avoid the extra
+     * memcpy in SetInputData(). The pointer remains valid for the lifetime
+     * of the engine (OV tensors are pre-allocated at compile time).
+     *
+     * @param name Input tensor name
+     * @return Raw pointer to the tensor data, or nullptr if not found
+     */
+    void* GetInputTensorBuffer(const std::string& name);
+
+    /**
+     * @brief Get direct pointer to output tensor's memory buffer (zero-copy).
+     *
+     * Read action data directly from this buffer to avoid the extra
+     * memcpy in GetOutputData().
+     *
+     * @param name Output tensor name
+     * @return Raw pointer to the tensor data, or nullptr if not found
+     */
+    const void* GetOutputTensorBuffer(const std::string& name) const;
+
+    /**
      * @brief Run inference (stream param ignored for OpenVINO).
      */
     bool Enqueue(cudaStream_t stream = nullptr);

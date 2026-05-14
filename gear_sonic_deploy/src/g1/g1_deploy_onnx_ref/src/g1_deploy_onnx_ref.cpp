@@ -348,6 +348,8 @@ class G1Deploy {
     std::string model_path;
     std::unique_ptr<EncoderEngine> encoder_engine_;
     EncoderConfig encoder_config_;  // Encoder configuration from observation config
+    InferenceConfig inference_config_;  // Inference device and affinity configuration
+    bool control_thread_affinity_set_ = false;  // One-shot flag for control thread CPU pinning
     bool is_using_encoder_ = false;
     int initial_encoder_mode_ = -2;  // -2: no token state. -1: need token state but no encoder. 0,1,2,...: encoder mode.
     int last_logged_encoder_mode_ = -999;  // Track last logged mode to avoid spam
@@ -2311,7 +2313,8 @@ class G1Deploy {
 
       obs_config_ = full_obs_config.observations;
       encoder_config_ = full_obs_config.encoder;
-      InferenceConfig inference_config = full_obs_config.inference;
+      inference_config_ = full_obs_config.inference;
+      InferenceConfig& inference_config = inference_config_;
 
       // Initialize control policy
       policy_engine_ = std::make_unique<PolicyEngine>();
@@ -2592,10 +2595,9 @@ class G1Deploy {
       struct sched_param param;
       param.sched_priority = sched_get_priority_max(SCHED_FIFO);
       pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
-      cpu_set_t cpuset;
-      CPU_ZERO(&cpuset);
-      CPU_SET(0, &cpuset);
-      pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+      // Note: CPU affinity for the control thread (encoder + decoder) is set
+      // inside Control() using inference_config_.cpu_affinity. This only sets
+      // the main thread's scheduling priority.
     }
 
     /// DDS callback: receives a 500 Hz LowState message from the robot SDK.
@@ -3094,10 +3096,11 @@ class G1Deploy {
      * (hardware order) using `g1_action_scale` and `default_angles`.
      */
     bool CreatePolicyCommand() {
-      // Convert double observation to float and populate policy's internal input buffer
-      auto& obs_buffer_float = policy_engine_->GetInputBuffer();
-      for (size_t i = 0; i < obs_buffer_.size(); i++) { 
-        obs_buffer_float[i] = static_cast<float>(obs_buffer_[i]); 
+      // Convert double observation to float — writes directly into OV tensor
+      // when zero-copy is available (no intermediate buffer copy)
+      float* input_ptr = policy_engine_->GetInputBufferPtr();
+      for (size_t i = 0; i < obs_buffer_.size(); i++) {
+        input_ptr[i] = static_cast<float>(obs_buffer_[i]);
       }
 
       // Run policy inference (handles CPU→GPU transfer, inference, GPU→CPU transfer)
@@ -3791,6 +3794,21 @@ class G1Deploy {
      */
     void Control() {
       if (operator_state.stop) { return; }
+
+      // Pin this thread to a specific CPU core (once) for deterministic
+      // encoder + decoder inference latency. Planner runs in a separate thread.
+      if (!control_thread_affinity_set_ && inference_config_.cpu_affinity >= 0) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(inference_config_.cpu_affinity, &cpuset);
+        if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) == 0) {
+          std::cout << "[Control] ✓ Thread pinned to CPU core " << inference_config_.cpu_affinity
+                    << " (encoder + decoder inference)" << std::endl;
+        } else {
+          std::cerr << "[Control] ⚠ Failed to pin thread to core " << inference_config_.cpu_affinity << std::endl;
+        }
+        control_thread_affinity_set_ = true;
+      }
 
       switch (program_state_) {
         case ProgramState::INIT:

@@ -99,12 +99,14 @@ struct EncoderConfig {
  *   encoder_device: "NPU"
  *   policy_device: "NPU"
  *   planner_device: "CPU"
+ *   cpu_affinity: 2          # Pin inference/control thread to this CPU core (-1 = no pinning)
  * ```
  */
 struct InferenceConfig {
   std::string encoder_device = "NPU";   ///< OpenVINO device for encoder ("NPU", "GPU", "CPU")
   std::string policy_device = "NPU";    ///< OpenVINO device for policy ("NPU", "GPU", "CPU")
   std::string planner_device = "CPU";   ///< OpenVINO device for planner ("CPU" recommended)
+  int cpu_affinity = -1;                ///< CPU core to pin inference thread to (-1 = no pinning)
 };
 
 /**
@@ -216,6 +218,15 @@ public:
         else if (line.find("planner_device:") != std::string::npos) {
           full_config.inference.planner_device = ExtractValue(line, "planner_device:");
           std::cout << "  Inference planner_device: " << full_config.inference.planner_device << std::endl;
+        }
+        else if (line.find("cpu_affinity:") != std::string::npos) {
+          std::string affinity_str = ExtractValue(line, "cpu_affinity:");
+          try {
+            full_config.inference.cpu_affinity = std::stoi(affinity_str);
+            std::cout << "  Inference cpu_affinity: " << full_config.inference.cpu_affinity << std::endl;
+          } catch (...) {
+            std::cerr << "  Warning: Invalid cpu_affinity value: " << affinity_str << std::endl;
+          }
         }
         continue;
       }

@@ -60,6 +60,7 @@ public:
         ov::element::Type element_type;
         ov::Shape shape;
         size_t byte_size;
+        void* data_ptr = nullptr;  // Cached raw pointer into OV tensor (avoids get_tensor() per call)
     };
     std::unordered_map<std::string, TensorMeta> input_meta;
     std::unordered_map<std::string, TensorMeta> output_meta;
@@ -138,6 +139,24 @@ bool OVInferenceEngine::Initialize(const std::string& modelPath, const std::stri
         // Latency-optimized for real-time control
         config[ov::hint::performance_mode.name()] = ov::hint::PerformanceMode::LATENCY;
 
+        // Enable CPU pinning to reduce scheduling jitter on inference threads
+        config[ov::hint::enable_cpu_pinning.name()] = true;
+
+        // Single inference request — no queuing overhead for real-time control
+        config[ov::hint::num_requests.name()] = 1;
+
+        if (is_npu) {
+            // NPU-specific optimizations:
+            // - TURBO mode: prioritize latency over power efficiency
+            // - Single compute pipeline for deterministic timing
+            try {
+                config["NPU_TURBO"] = "YES";
+                std::cout << "[OVInference] NPU TURBO mode enabled" << std::endl;
+            } catch (...) {
+                // NPU_TURBO may not be available on all NPU drivers
+            }
+        }
+
         // Compile model (uses cache if available, otherwise compiles and stores to cache)
         m_impl->compiled_model = m_impl->core.compile_model(m_impl->model, device, config);
         m_impl->device_used = device;
@@ -145,25 +164,27 @@ bool OVInferenceEngine::Initialize(const std::string& modelPath, const std::stri
         // Create inference request
         m_impl->infer_request = m_impl->compiled_model.create_infer_request();
 
-        // Cache input metadata
+        // Cache input metadata + raw data pointers (avoids get_tensor() per inference call)
         for (const auto& input : m_impl->model->inputs()) {
             std::string name = input.get_any_name();
             auto shape = input.get_shape();
             auto type = input.get_element_type();
             size_t byte_size = ov::shape_size(shape) * type.size();
 
-            m_impl->input_meta[name] = {type, shape, byte_size};
+            ov::Tensor tensor = m_impl->infer_request.get_tensor(name);
+            m_impl->input_meta[name] = {type, shape, byte_size, tensor.data()};
             m_impl->input_names.push_back(name);
         }
 
-        // Cache output metadata
+        // Cache output metadata + raw data pointers
         for (const auto& output : m_impl->model->outputs()) {
             std::string name = output.get_any_name();
             auto shape = output.get_shape();
             auto type = output.get_element_type();
             size_t byte_size = ov::shape_size(shape) * type.size();
 
-            m_impl->output_meta[name] = {type, shape, byte_size};
+            ov::Tensor tensor = m_impl->infer_request.get_tensor(name);
+            m_impl->output_meta[name] = {type, shape, byte_size, tensor.data()};
             m_impl->output_names.push_back(name);
         }
 
@@ -205,7 +226,7 @@ void OVInferenceEngine::Destroy() {
 }
 
 // ============================================================================
-// SetInputData (sync)
+// SetInputData (sync) — uses cached data pointer, no get_tensor() overhead
 // ============================================================================
 void OVInferenceEngine::SetInputData(const std::string& name, const void* data, size_t byteCount) {
     if (!m_impl->initialized) return;
@@ -216,14 +237,12 @@ void OVInferenceEngine::SetInputData(const std::string& name, const void* data, 
         return;
     }
 
-    // Get the input tensor from the infer request and copy data into it
-    ov::Tensor tensor = m_impl->infer_request.get_tensor(name);
     size_t copy_size = std::min(byteCount, it->second.byte_size);
-    std::memcpy(tensor.data(), data, copy_size);
+    std::memcpy(it->second.data_ptr, data, copy_size);
 }
 
 // ============================================================================
-// GetOutputData (sync)
+// GetOutputData (sync) — uses cached data pointer, no get_tensor() overhead
 // ============================================================================
 void OVInferenceEngine::GetOutputData(const std::string& name, void* data, size_t byteCount) {
     if (!m_impl->initialized) return;
@@ -234,9 +253,8 @@ void OVInferenceEngine::GetOutputData(const std::string& name, void* data, size_
         return;
     }
 
-    ov::Tensor tensor = m_impl->infer_request.get_tensor(name);
     size_t copy_size = std::min(byteCount, it->second.byte_size);
-    std::memcpy(data, tensor.data(), copy_size);
+    std::memcpy(data, it->second.data_ptr, copy_size);
 }
 
 // ============================================================================
@@ -306,4 +324,19 @@ DataType OVInferenceEngine::GetTensorDataType(std::string name) const {
 
 std::string OVInferenceEngine::GetDevice() const {
     return m_impl->device_used;
+}
+
+// ============================================================================
+// Zero-copy buffer access
+// ============================================================================
+void* OVInferenceEngine::GetInputTensorBuffer(const std::string& name) {
+    auto it = m_impl->input_meta.find(name);
+    if (it == m_impl->input_meta.end()) return nullptr;
+    return it->second.data_ptr;
+}
+
+const void* OVInferenceEngine::GetOutputTensorBuffer(const std::string& name) const {
+    auto it = m_impl->output_meta.find(name);
+    if (it == m_impl->output_meta.end()) return nullptr;
+    return it->second.data_ptr;
 }
