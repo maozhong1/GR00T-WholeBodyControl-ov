@@ -166,11 +166,16 @@ private:
             return false;
         }
 
-        std::cout << "[Planner] Initializing with OpenVINO backend (" << config_.device << ", FP32)..." << std::endl;
+        // Device-aware precision:
+        //   GPU/NPU → FP16 (native, handled by OVInferenceEngine)
+        //   CPU → FP32 (AVX/AVX-512 accelerated)
+        Precision planner_precision = use_fp16_ ? Precision::FP16 : Precision::FP32;
+        std::string precision_str = (config_.device == "GPU" || config_.device == "NPU" || use_fp16_) ? "FP16" : "FP32";
+        std::cout << "[Planner] Initializing with OpenVINO backend (" << config_.device << ", " << precision_str << ")..." << std::endl;
         std::cout << "[Planner] Model: " << model_file << std::endl;
 
         auto init_start = std::chrono::steady_clock::now();
-        if (!inference_engine_->Initialize(model_file, config_.device, Precision::FP32)) {
+        if (!inference_engine_->Initialize(model_file, config_.device, planner_precision)) {
             std::cout << "✗ Failed to initialize planner on " << config_.device << ": " << model_file << std::endl;
             return false;
         }

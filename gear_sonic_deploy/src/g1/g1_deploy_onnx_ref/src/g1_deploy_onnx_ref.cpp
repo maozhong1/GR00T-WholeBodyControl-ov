@@ -2408,7 +2408,7 @@ class G1Deploy {
           throw std::runtime_error("Unsupported planner version: " + planner_path);
         }
         planner_config.device = inference_config.planner_device;
-        planner_ = std::make_unique<LocalMotionPlannerTensorRT>(false, 0, planner_config);
+        planner_ = std::make_unique<LocalMotionPlannerTensorRT>(planner_fp16, 0, planner_config);
       }
       
       // Initialize observation function map
