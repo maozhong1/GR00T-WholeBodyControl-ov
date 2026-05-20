@@ -1646,8 +1646,13 @@ class G1Deploy {
 
     /// Populate the token_state observation (either from local encoder or external data).
     bool GatherTokenState(std::vector<double>& target_buffer, size_t offset) {
+      static int gather_token_log_counter_ = 0;
       if (!is_using_encoder_) {
         // No encoder configured; use token_state_data_ (can be set externally via ROS2/ZMQ)
+        if (gather_token_log_counter_++ % 500 == 0) {
+          std::cout << "[TokenState] Using EXTERNAL tokens (encoder NOT active), tokens[0]="
+                    << token_state_data_[0] << std::endl;
+        }
         std::copy(token_state_data_.begin(), token_state_data_.end(), target_buffer.begin() + offset);
         return true;
       }
@@ -1664,9 +1669,15 @@ class G1Deploy {
       }
 
       // Run encoder inference (handles CPU→GPU transfer, inference, GPU→CPU transfer)
+      auto encoder_start = std::chrono::steady_clock::now();
       if (!encoder_engine_->Encode()) {
         std::cerr << "✗ Error: Encoder inference failed" << std::endl;
         return false;
+      }
+      auto encoder_end = std::chrono::steady_clock::now();
+      if (gather_token_log_counter_++ % 500 == 0) {
+        auto encoder_us = std::chrono::duration_cast<std::chrono::microseconds>(encoder_end - encoder_start).count();
+        std::cout << "[TokenState] Using LOCAL ENCODER inference (" << encoder_us << " us)" << std::endl;
       }
 
       // Access encoded tokens from encoder's internal buffer (already populated by Encode)
@@ -2408,6 +2419,9 @@ class G1Deploy {
           throw std::runtime_error("Unsupported planner version: " + planner_path);
         }
         planner_config.device = inference_config.planner_device;
+        planner_config.dump_input_csv = inference_config.dump_planner_input;
+        planner_config.max_input_dump_cnt = inference_config.max_input_dump_cnt;
+        planner_config.dump_csv_path = inference_config.dump_csv_path;
         planner_ = std::make_unique<LocalMotionPlannerTensorRT>(planner_fp16, 0, planner_config);
       }
       

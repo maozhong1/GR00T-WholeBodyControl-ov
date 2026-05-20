@@ -216,6 +216,9 @@ struct PlannerConfig {
     int motion_look_ahead_steps = 2;      // 50Hz: 0.02s * 2 = 0.04s
     double default_height = 0.788740;      // Default robot height
     int initial_random_seed = 1234;        // Initial random seed for planner
+    bool dump_input_csv = false;           // Enable CSV dump of inference inputs for accuracy validation
+    int max_input_dump_cnt = 100;          // Max number of inference inputs to dump (0 = unlimited)
+    std::string dump_csv_path = "planner_input_dump.csv";  // Path for the CSV dump file
 };
 
 /**
