@@ -99,6 +99,9 @@ struct EncoderConfig {
  *   encoder_device: "NPU"
  *   policy_device: "NPU"
  *   planner_device: "CPU"
+ *   encoder_npu_tiles: 1     # NPU tiles for encoder (0=auto, 1-N=specific)
+ *   policy_npu_tiles: 1      # NPU tiles for decoder (0=auto, 1-N=specific)
+ *   planner_npu_tiles: 3     # NPU tiles for planner (0=auto, 1-N=specific)
  *   cpu_affinity: 2          # Pin inference/control thread to this CPU core (-1 = no pinning)
  *   dump_planner_input: false # Enable CSV dump of planner inputs for accuracy validation
  *   max_input_dump_cnt: 100  # Max rows to dump (0 = unlimited)
@@ -109,6 +112,9 @@ struct InferenceConfig {
   std::string encoder_device = "NPU";   ///< OpenVINO device for encoder ("NPU", "GPU", "CPU")
   std::string policy_device = "NPU";    ///< OpenVINO device for policy ("NPU", "GPU", "CPU")
   std::string planner_device = "CPU";   ///< OpenVINO device for planner ("CPU" recommended)
+  int encoder_npu_tiles = 1;            ///< NPU tiles for encoder (0 = auto, 1-N = specific count)
+  int policy_npu_tiles = 1;             ///< NPU tiles for decoder/policy (0 = auto, 1-N = specific count)
+  int planner_npu_tiles = 3;            ///< NPU tiles for planner (0 = auto, 1-N = specific count)
   int cpu_affinity = -1;                ///< CPU core to pin inference thread to (-1 = no pinning)
   bool dump_planner_input = false;      ///< Enable CSV dump of planner inputs for accuracy validation
   int max_input_dump_cnt = 100;         ///< Max number of planner input rows to dump (0 = unlimited)
@@ -224,6 +230,33 @@ public:
         else if (line.find("planner_device:") != std::string::npos) {
           full_config.inference.planner_device = ExtractValue(line, "planner_device:");
           std::cout << "  Inference planner_device: " << full_config.inference.planner_device << std::endl;
+        }
+        else if (line.find("encoder_npu_tiles:") != std::string::npos) {
+          std::string val = ExtractValue(line, "encoder_npu_tiles:");
+          try {
+            full_config.inference.encoder_npu_tiles = std::stoi(val);
+            std::cout << "  Inference encoder_npu_tiles: " << full_config.inference.encoder_npu_tiles << std::endl;
+          } catch (...) {
+            std::cerr << "  Warning: Invalid encoder_npu_tiles value: " << val << std::endl;
+          }
+        }
+        else if (line.find("policy_npu_tiles:") != std::string::npos) {
+          std::string val = ExtractValue(line, "policy_npu_tiles:");
+          try {
+            full_config.inference.policy_npu_tiles = std::stoi(val);
+            std::cout << "  Inference policy_npu_tiles: " << full_config.inference.policy_npu_tiles << std::endl;
+          } catch (...) {
+            std::cerr << "  Warning: Invalid policy_npu_tiles value: " << val << std::endl;
+          }
+        }
+        else if (line.find("planner_npu_tiles:") != std::string::npos) {
+          std::string val = ExtractValue(line, "planner_npu_tiles:");
+          try {
+            full_config.inference.planner_npu_tiles = std::stoi(val);
+            std::cout << "  Inference planner_npu_tiles: " << full_config.inference.planner_npu_tiles << std::endl;
+          } catch (...) {
+            std::cerr << "  Warning: Invalid planner_npu_tiles value: " << val << std::endl;
+          }
         }
         else if (line.find("cpu_affinity:") != std::string::npos) {
           std::string affinity_str = ExtractValue(line, "cpu_affinity:");

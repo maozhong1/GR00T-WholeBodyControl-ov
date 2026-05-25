@@ -103,7 +103,7 @@ bool OVInferenceEngine::Initialize(const std::string& modelPath, int /*deviceID*
 // Initialize (extended, with device selection)
 // ============================================================================
 bool OVInferenceEngine::Initialize(const std::string& modelPath, const std::string& device,
-                                   Precision precision) {
+                                   Precision precision, int npu_tiles) {
     try {
         std::cout << "[OVInference] Loading model: " << modelPath << std::endl;
         std::cout << "[OVInference] Requested device: " << device << std::endl;
@@ -154,6 +154,25 @@ bool OVInferenceEngine::Initialize(const std::string& modelPath, const std::stri
                 std::cout << "[OVInference] NPU TURBO mode enabled" << std::endl;
             } catch (...) {
                 // NPU_TURBO may not be available on all NPU drivers
+            }
+
+            // NPU tile allocation: restrict how many tiles this model uses.
+            // npu_tiles=0 means auto (use driver default), >0 means explicit count.
+            if (npu_tiles > 0) {
+                try {
+                    config["NPU_TILES"] = std::to_string(npu_tiles);
+                    std::cout << "[OVInference] NPU_TILES set to " << npu_tiles << std::endl;
+                } catch (...) {
+                    std::cout << "[OVInference] Warning: NPU_TILES property not supported by this driver" << std::endl;
+                }
+            }
+
+            // Log available tile info
+            try {
+                auto max_tiles = m_impl->core.get_property("NPU", "NPU_MAX_TILES");
+                std::cout << "[OVInference] NPU max tiles available: " << max_tiles.as<int>() << std::endl;
+            } catch (...) {
+                // NPU_MAX_TILES may not be supported on older drivers
             }
         }
 
