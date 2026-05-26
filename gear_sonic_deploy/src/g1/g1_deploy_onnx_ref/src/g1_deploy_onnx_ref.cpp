@@ -289,6 +289,29 @@ class G1Deploy {
     static constexpr std::chrono::milliseconds STREAMING_DATA_ABSENT_THRESHOLD{150};
     CounterDebouncer streaming_data_absent_debouncer_{100, 500, 50, 1};
     RollingStats<1000> streaming_data_delay_rolling_stats_;
+    // Cumulative stats for inference timing (in microseconds, whole test duration).
+    // Uses Welford's online algorithm — no sum accumulation, so no overflow or
+    // floating-point precision loss regardless of run duration.
+    // The first kWarmupTicks are ignored to exclude model loading / NPU warm-up spikes.
+    static constexpr int kWarmupTicks = 100;  // Skip first 100 ticks for stats
+    struct CumulativeStats {
+      int64_t count = 0;
+      double mean_ = 0.0;
+      double min_ = std::numeric_limits<double>::max();
+      double max_ = 0.0;
+      double mean() const { return mean_; }
+      double min() const { return count > 0 ? min_ : 0.0; }
+      double max() const { return max_; }
+      void push(double v) {
+        count++;
+        mean_ += (v - mean_) / static_cast<double>(count);
+        if (v < min_) min_ = v;
+        if (v > max_) max_ = v;
+      }
+    };
+    CumulativeStats obs_duration_stats_;
+    CumulativeStats policy_duration_stats_;
+    CumulativeStats obs_to_motor_cmd_duration_stats_;
     std::unique_ptr<AudioThread> audio_thread_;
     
     // =========================================================================
@@ -4123,20 +4146,33 @@ class G1Deploy {
             return;
           }
 
+          // Accumulate inference timing stats every tick (skip warm-up phase)
+          if (logging_counter_ > kWarmupTicks) {
+            auto obs_duration_tick = std::chrono::duration_cast<std::chrono::microseconds>(obs_end_time - obs_start_time);
+            auto policy_duration_tick = std::chrono::duration_cast<std::chrono::microseconds>(motor_command_end_time - obs_end_time);
+            auto motor_command_duration_tick = std::chrono::duration_cast<std::chrono::microseconds>(motor_command_end_time - obs_start_time);
+            obs_duration_stats_.push(static_cast<double>(obs_duration_tick.count()));
+            policy_duration_stats_.push(static_cast<double>(policy_duration_tick.count()));
+            obs_to_motor_cmd_duration_stats_.push(static_cast<double>(motor_command_duration_tick.count()));
+          }
+
           if (logging_counter_ % kControlFrequencyHz == 0) {  // Log every ~1s
             auto control_loop_end_time = std::chrono::steady_clock::now();
             auto obs_duration = std::chrono::duration_cast<std::chrono::microseconds>(obs_end_time - obs_start_time);
             auto policy_duration = std::chrono::duration_cast<std::chrono::microseconds>(motor_command_end_time - obs_end_time);
             auto motor_command_duration = std::chrono::duration_cast<std::chrono::microseconds>(motor_command_end_time - obs_start_time);
             auto post_hand_joint_duration = std::chrono::duration_cast<std::chrono::microseconds>(control_loop_end_time - hand_joint_end_time);
-            
+
             std::cout << "Loop timing - LowState age: " << used_low_state_data_.GetAgeMs() << "ms"
                       << ", Streaming data mean delay: " << streaming_data_delay_rolling_stats_.mean() << "ms"
                       << ", Streaming data std delay: " << streaming_data_delay_rolling_stats_.stddev() << "ms"
                       << ", IMU age: " << used_imu_torso_data_.GetAgeMs() << "ms"
-                      << ", Obs: " << obs_duration.count() << "us"
-                      << ", Policy: " << policy_duration.count() << "us"
-                      << ", Obs 2 Motor Command: " << motor_command_duration.count() << "us"
+                      << ", Obs: " << obs_duration.count() << "us (avg:" << static_cast<int>(obs_duration_stats_.mean())
+                        << " min:" << static_cast<int>(obs_duration_stats_.min()) << " max:" << static_cast<int>(obs_duration_stats_.max()) << ")"
+                      << ", Policy: " << policy_duration.count() << "us (avg:" << static_cast<int>(policy_duration_stats_.mean())
+                        << " min:" << static_cast<int>(policy_duration_stats_.min()) << " max:" << static_cast<int>(policy_duration_stats_.max()) << ")"
+                      << ", Obs 2 Motor Command: " << motor_command_duration.count() << "us (avg:" << static_cast<int>(obs_to_motor_cmd_duration_stats_.mean())
+                        << " min:" << static_cast<int>(obs_to_motor_cmd_duration_stats_.min()) << " max:" << static_cast<int>(obs_to_motor_cmd_duration_stats_.max()) << ")"
                       << ", Post processing: " << post_hand_joint_duration.count() << "us";
             
             // Add planner timing if planner is enabled and initialized
