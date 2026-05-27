@@ -155,6 +155,16 @@ bool OVInferenceEngine::Initialize(const std::string& modelPath, const std::stri
             } catch (...) {
                 // NPU_TURBO may not be available on all NPU drivers
             }
+            config["NPU_COMPILER_TYPE"] = "PLUGIN";   
+            // Force higher precision on numerically sensitive layers (ReduceSum, Multiply)
+            // to avoid FP16 accumulation errors in planner-style models.
+            try {
+                config["NPU_COMPILATION_MODE_PARAMS"] =
+                    "compute-layers-with-higher-precision=ReduceSum,Multiply";
+                std::cout << "[OVInference] NPU higher-precision layers: ReduceSum,Multiply" << std::endl;
+            } catch (...) {
+                std::cout << "[OVInference] Warning: NPU_COMPILATION_MODE_PARAMS not supported by this driver" << std::endl;
+            }
 
             // NPU tile allocation: restrict how many tiles this model uses.
             // npu_tiles=0 means auto (use driver default), >0 means explicit count.
