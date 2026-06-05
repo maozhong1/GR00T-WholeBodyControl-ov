@@ -59,10 +59,14 @@
 #include <chrono>
 #include <unistd.h>
 #include <cstring>
+#include <cstdlib>
+#include <cctype>
 #include <functional>
 #include <unordered_map>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
+#include <sstream>
 #include <chrono>
 #include <algorithm>
 #include <numeric>
@@ -293,20 +297,79 @@ class G1Deploy {
     // Uses Welford's online algorithm — no sum accumulation, so no overflow or
     // floating-point precision loss regardless of run duration.
     // The first kWarmupTicks are ignored to exclude model loading / NPU warm-up spikes.
+    // Uses a 5-minute sliding window for percentile (P99) computation so that
+    // stats reflect recent behavior rather than all-time history.
     static constexpr int kWarmupTicks = 100;  // Skip first 100 ticks for stats
+    static constexpr int kPlannerWarmupTicks = 50;  // Skip 50 ticks after planner init
+    int planner_warmup_remaining_ = 0;  // Countdown after planner init
     struct CumulativeStats {
-      int64_t count = 0;
-      double mean_ = 0.0;
+      // Sliding window size: 5 minutes at 50 Hz = 15000 samples.
+      static constexpr size_t kWindowSize = 15000;
+      std::vector<double> window_;
+      size_t write_pos_ = 0;
+      bool window_full_ = false;
+      bool window_sorted_ = false;
+      std::vector<double> sorted_cache_;
+
       double min_ = std::numeric_limits<double>::max();
       double max_ = 0.0;
-      double mean() const { return mean_; }
-      double min() const { return count > 0 ? min_ : 0.0; }
+      double sum_ = 0.0;
+
+      double mean() const {
+        size_t n = window_full_ ? kWindowSize : write_pos_;
+        return n > 0 ? sum_ / static_cast<double>(n) : 0.0;
+      }
+      double min() const { return write_pos_ > 0 || window_full_ ? min_ : 0.0; }
       double max() const { return max_; }
+
+      // Return the value at the given percentile (0.0–1.0) over the sliding window.
+      double percentile(double p) {
+        size_t n = window_full_ ? kWindowSize : write_pos_;
+        if (n == 0) return 0.0;
+        if (!window_sorted_) {
+          sorted_cache_.assign(window_.begin(), window_.begin() + static_cast<ptrdiff_t>(n));
+          std::sort(sorted_cache_.begin(), sorted_cache_.end());
+          window_sorted_ = true;
+        }
+        size_t idx = static_cast<size_t>(p * static_cast<double>(sorted_cache_.size() - 1));
+        return sorted_cache_[idx];
+      }
+
       void push(double v) {
-        count++;
-        mean_ += (v - mean_) / static_cast<double>(count);
-        if (v < min_) min_ = v;
-        if (v > max_) max_ = v;
+        size_t n = window_full_ ? kWindowSize : write_pos_;
+
+        // Subtract the sample being evicted from the running sum.
+        if (window_full_) {
+          sum_ -= window_[write_pos_];
+        }
+        sum_ += v;
+
+        // Write into the circular buffer.
+        if (window_.size() < kWindowSize) {
+          window_.push_back(v);
+        } else {
+          window_[write_pos_] = v;
+        }
+        write_pos_ = (write_pos_ + 1) % kWindowSize;
+        if (write_pos_ == 0 && !window_full_) window_full_ = true;
+
+        // Recompute min/max over the window (cheap for 3000 elements).
+        n = window_full_ ? kWindowSize : write_pos_;
+        min_ = *std::min_element(window_.begin(), window_.begin() + static_cast<ptrdiff_t>(n));
+        max_ = *std::max_element(window_.begin(), window_.begin() + static_cast<ptrdiff_t>(n));
+
+        window_sorted_ = false;
+      }
+
+      void reset() {
+        window_.clear();
+        write_pos_ = 0;
+        window_full_ = false;
+        window_sorted_ = false;
+        sorted_cache_.clear();
+        min_ = std::numeric_limits<double>::max();
+        max_ = 0.0;
+        sum_ = 0.0;
       }
     };
     CumulativeStats obs_duration_stats_;
@@ -385,6 +448,16 @@ class G1Deploy {
                   "Control frequency must be <= command writer rate (500 Hz)");
     static_assert(kControlFrequencyHz % kMotionPlaybackHz == 0,
                   "Control frequency must be an integer multiple of 50 Hz");
+
+    // Dump the per-motor MotorCmd_ subcommand fields (mode/q/dq/tau/kp/kd)
+    // once every 10 seconds (0.1 Hz), taken from inside LowCommandWriter()
+    // right before the DDS Write, i.e. exactly the bytes that go on the wire
+    // to MuJoCo. The publish loop runs at 500 Hz, so a decimation of 5000
+    // yields exactly one dump per 10 seconds.
+    static constexpr int kPublishHz = 500;
+    static constexpr int kDecoderDumpPeriodSec = 10;
+    static constexpr int kDecoderDumpDecimation = kPublishHz * kDecoderDumpPeriodSec;
+    int decoder_dump_counter_ = 0;
 
     int frame_advance_counter_ = 0;
     TimestampedData<LowState_> used_low_state_data_;
@@ -2751,6 +2824,43 @@ class G1Deploy {
         }
 
         dds_low_command.crc() = Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
+
+        // 0.1 Hz (every 10 s) dump of the full per-motor DDS subcommand
+        // (MotorCmd_ fields) immediately before publishing, so the printout
+        // matches the wire bytes. Off by default; enable with the
+        // DUMP_SUBCMD env var ("1"/"true"/"on"/"yes"), e.g.
+        //   DUMP_SUBCMD=1 bash deploy.sh sim
+        static const bool kDumpSubCmdEnabled = []() {
+          const char* v = std::getenv("DUMP_SUBCMD");
+          if (!v) return false;
+          std::string s(v);
+          std::transform(s.begin(), s.end(), s.begin(),
+                         [](unsigned char c) { return std::tolower(c); });
+          return s == "1" || s == "true" || s == "on" || s == "yes";
+        }();
+        if (kDumpSubCmdEnabled &&
+            (decoder_dump_counter_++ % kDecoderDumpDecimation) == 0) {
+          std::ostringstream oss;
+          oss.setf(std::ios::fixed);
+          oss.precision(6);
+          oss << "[MotorCmdDump] mode_pr=" << static_cast<int>(dds_low_command.mode_pr())
+              << " mode_machine=" << static_cast<int>(dds_low_command.mode_machine())
+              << " crc=0x" << std::hex << dds_low_command.crc() << std::dec << "\n";
+          for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
+            const auto& m = dds_low_command.motor_cmd().at(i);
+            oss << "  [" << std::setw(2) << i << "]"
+                << " mode=" << static_cast<int>(m.mode())
+                << " q=" << m.q()
+                << " dq=" << m.dq()
+                << " tau=" << m.tau()
+                << " kp=" << m.kp()
+                << " kd=" << m.kd()
+                << " reserve=" << m.reserve()
+                << "\n";
+          }
+          std::cout << oss.str() << std::flush;
+        }
+
         lowcmd_publisher_->Write(dds_low_command);
       }
 
@@ -3675,6 +3785,17 @@ class G1Deploy {
               }
 
               std::cout << "Planner initialized successfully!" << std::endl;
+
+              // Reset inference timing stats after planner init to exclude the
+              // one-time initialization spike from steady-state measurements.
+              // Also skip the next kPlannerWarmupTicks ticks to let the system
+              // settle (NPU pipeline fill, thread scheduling stabilization).
+              obs_duration_stats_.reset();
+              policy_duration_stats_.reset();
+              obs_to_motor_cmd_duration_stats_.reset();
+              planner_warmup_remaining_ = kPlannerWarmupTicks;
+              std::cout << "[Stats] Reset inference timing stats after planner init (skipping "
+                        << kPlannerWarmupTicks << " warmup ticks)" << std::endl;
               
               // Start recording session for planner motion (if enabled)
               if (enable_motion_recording_) {
@@ -4146,8 +4267,10 @@ class G1Deploy {
             return;
           }
 
-          // Accumulate inference timing stats every tick (skip warm-up phase)
-          if (logging_counter_ > kWarmupTicks) {
+          // Accumulate inference timing stats every tick (skip warm-up phases)
+          if (planner_warmup_remaining_ > 0) {
+            planner_warmup_remaining_--;
+          } else if (logging_counter_ > kWarmupTicks) {
             auto obs_duration_tick = std::chrono::duration_cast<std::chrono::microseconds>(obs_end_time - obs_start_time);
             auto policy_duration_tick = std::chrono::duration_cast<std::chrono::microseconds>(motor_command_end_time - obs_end_time);
             auto motor_command_duration_tick = std::chrono::duration_cast<std::chrono::microseconds>(motor_command_end_time - obs_start_time);
@@ -4168,11 +4291,17 @@ class G1Deploy {
                       << ", Streaming data std delay: " << streaming_data_delay_rolling_stats_.stddev() << "ms"
                       << ", IMU age: " << used_imu_torso_data_.GetAgeMs() << "ms"
                       << ", Obs: " << obs_duration.count() << "us (avg:" << static_cast<int>(obs_duration_stats_.mean())
-                        << " min:" << static_cast<int>(obs_duration_stats_.min()) << " max:" << static_cast<int>(obs_duration_stats_.max()) << ")"
+                        << " min:" << static_cast<int>(obs_duration_stats_.min())
+                        << " P99:" << static_cast<int>(obs_duration_stats_.percentile(0.99))
+                        << " max:" << static_cast<int>(obs_duration_stats_.max()) << ")"
                       << ", Policy: " << policy_duration.count() << "us (avg:" << static_cast<int>(policy_duration_stats_.mean())
-                        << " min:" << static_cast<int>(policy_duration_stats_.min()) << " max:" << static_cast<int>(policy_duration_stats_.max()) << ")"
+                        << " min:" << static_cast<int>(policy_duration_stats_.min())
+                        << " P99:" << static_cast<int>(policy_duration_stats_.percentile(0.99))
+                        << " max:" << static_cast<int>(policy_duration_stats_.max()) << ")"
                       << ", Obs 2 Motor Command: " << motor_command_duration.count() << "us (avg:" << static_cast<int>(obs_to_motor_cmd_duration_stats_.mean())
-                        << " min:" << static_cast<int>(obs_to_motor_cmd_duration_stats_.min()) << " max:" << static_cast<int>(obs_to_motor_cmd_duration_stats_.max()) << ")"
+                        << " min:" << static_cast<int>(obs_to_motor_cmd_duration_stats_.min())
+                        << " P99:" << static_cast<int>(obs_to_motor_cmd_duration_stats_.percentile(0.99))
+                        << " max:" << static_cast<int>(obs_to_motor_cmd_duration_stats_.max()) << ")"
                       << ", Post processing: " << post_hand_joint_duration.count() << "us";
             
             // Add planner timing if planner is enabled and initialized
