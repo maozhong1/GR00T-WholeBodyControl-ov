@@ -213,6 +213,7 @@ struct PlannerConfig {
     std::string model_path = "";
     std::string device = "CPU";            // OpenVINO device ("CPU", "NPU", "GPU")
     int npu_tiles = 3;                     // NPU tiles for planner (0 = auto, 1-N = specific count)
+    std::string model_priority = "NORMAL"; // OV model priority ("HIGH", "NORMAL", "LOW")
     int version = 0;
     int motion_look_ahead_steps = 2;      // 50Hz: 0.02s * 2 = 0.04s
     double default_height = 0.788740;      // Default robot height

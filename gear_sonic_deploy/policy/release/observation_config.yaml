@@ -86,9 +86,15 @@ inference:
   # NPU tile allocation per model (0=auto/driver default, 1-N=specific tile count).
   # Encoder+decoder run sequentially in the control thread — 1 tile each is sufficient.
   # Planner runs in a separate thread — can use more tiles for throughput.
-  encoder_npu_tiles: 1
-  policy_npu_tiles: 1
-  planner_npu_tiles: 0
+  encoder_npu_tiles: 3
+  policy_npu_tiles: 3
+  planner_npu_tiles: 3
+  # OpenVINO model priority: HIGH, NORMAL, or LOW. Controls how the OV scheduler
+  # arbitrates models that share the same device (e.g. policy/encoder/planner on
+  # one NPU). Mapped to ov::hint::model_priority. Default: NORMAL.
+  encoder_priority: "HIGH"
+  policy_priority: "HIGH"
+  planner_priority: "NORMAL"
   # Pin the inference/control thread to a specific CPU core to reduce latency jitter.
   # Set to -1 to disable pinning (default), or a core number (e.g., 10) to pin.
   # Here 10 is one of isolated core, dedicated for inference.

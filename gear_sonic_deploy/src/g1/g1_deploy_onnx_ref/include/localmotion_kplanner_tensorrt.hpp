@@ -256,7 +256,8 @@ private:
         std::cout << "[Planner] Model: " << model_file << std::endl;
 
         auto init_start = std::chrono::steady_clock::now();
-        if (!inference_engine_->Initialize(model_file, config_.device, planner_precision, config_.npu_tiles)) {
+        if (!inference_engine_->Initialize(model_file, config_.device, planner_precision,
+                                           config_.npu_tiles, config_.model_priority)) {
             std::cout << "✗ Failed to initialize planner on " << config_.device << ": " << model_file << std::endl;
             return false;
         }

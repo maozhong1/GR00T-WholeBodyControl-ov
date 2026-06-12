@@ -2458,7 +2458,9 @@ class G1Deploy {
       // Initialize control policy
       policy_engine_ = std::make_unique<PolicyEngine>();
 
-      if (!policy_engine_->Initialize(model_path, policy_fp16, inference_config.policy_device, inference_config.policy_npu_tiles)) {
+      if (!policy_engine_->Initialize(model_path, policy_fp16, inference_config.policy_device,
+                                      inference_config.policy_npu_tiles,
+                                      inference_config.policy_priority)) {
         throw std::runtime_error("Failed to initialize control policy from: " + model_path);
       }
 
@@ -2483,7 +2485,10 @@ class G1Deploy {
         std::cout << "Initializing encoder..." << std::endl;
         encoder_engine_ = std::make_unique<EncoderEngine>();
         
-        if (!encoder_engine_->Initialize(encoder_file_path, encoder_config_.use_fp16, inference_config.encoder_device, inference_config.encoder_npu_tiles)) {
+        if (!encoder_engine_->Initialize(encoder_file_path, encoder_config_.use_fp16,
+                                         inference_config.encoder_device,
+                                         inference_config.encoder_npu_tiles,
+                                         inference_config.encoder_priority)) {
           throw std::runtime_error("Failed to initialize encoder engine from: " + encoder_file_path);
         }
         
@@ -2548,6 +2553,7 @@ class G1Deploy {
         }
         planner_config.device = inference_config.planner_device;
         planner_config.npu_tiles = inference_config.planner_npu_tiles;
+        planner_config.model_priority = inference_config.planner_priority;
         planner_config.dump_input_csv = inference_config.dump_planner_input;
         planner_config.max_input_dump_cnt = inference_config.max_input_dump_cnt;
         planner_config.dump_csv_path = inference_config.dump_csv_path;

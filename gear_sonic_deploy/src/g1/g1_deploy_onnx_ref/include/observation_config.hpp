@@ -46,6 +46,7 @@
 #include <fstream>
 #include <iostream>
 #include <algorithm>
+#include <cctype>
 
 /**
  * @brief Configuration for a single observation type (name + enabled flag).
@@ -102,6 +103,9 @@ struct EncoderConfig {
  *   encoder_npu_tiles: 1     # NPU tiles for encoder (0=auto, 1-N=specific)
  *   policy_npu_tiles: 1      # NPU tiles for decoder (0=auto, 1-N=specific)
  *   planner_npu_tiles: 3     # NPU tiles for planner (0=auto, 1-N=specific)
+ *   encoder_priority: "NORMAL" # OpenVINO model priority (HIGH, NORMAL, LOW)
+ *   policy_priority: "NORMAL"  # OpenVINO model priority (HIGH, NORMAL, LOW)
+ *   planner_priority: "NORMAL" # OpenVINO model priority (HIGH, NORMAL, LOW)
  *   cpu_affinity: 2          # Pin inference/control thread to this CPU core (-1 = no pinning)
  *   dump_planner_input: false # Enable CSV dump of planner inputs for accuracy validation
  *   max_input_dump_cnt: 100  # Max rows to dump (0 = unlimited)
@@ -115,6 +119,9 @@ struct InferenceConfig {
   int encoder_npu_tiles = 1;            ///< NPU tiles for encoder (0 = auto, 1-N = specific count)
   int policy_npu_tiles = 1;             ///< NPU tiles for decoder/policy (0 = auto, 1-N = specific count)
   int planner_npu_tiles = 3;            ///< NPU tiles for planner (0 = auto, 1-N = specific count)
+  std::string encoder_priority = "NORMAL"; ///< OV model priority for encoder ("HIGH", "NORMAL", "LOW")
+  std::string policy_priority = "NORMAL";  ///< OV model priority for policy ("HIGH", "NORMAL", "LOW")
+  std::string planner_priority = "NORMAL"; ///< OV model priority for planner ("HIGH", "NORMAL", "LOW")
   int cpu_affinity = -1;                ///< CPU core to pin inference thread to (-1 = no pinning)
   bool dump_planner_input = false;      ///< Enable CSV dump of planner inputs for accuracy validation
   int max_input_dump_cnt = 100;         ///< Max number of planner input rows to dump (0 = unlimited)
@@ -257,6 +264,21 @@ public:
           } catch (...) {
             std::cerr << "  Warning: Invalid planner_npu_tiles value: " << val << std::endl;
           }
+        }
+        else if (line.find("encoder_priority:") != std::string::npos) {
+          full_config.inference.encoder_priority =
+              NormalizePriority(ExtractValue(line, "encoder_priority:"));
+          std::cout << "  Inference encoder_priority: " << full_config.inference.encoder_priority << std::endl;
+        }
+        else if (line.find("policy_priority:") != std::string::npos) {
+          full_config.inference.policy_priority =
+              NormalizePriority(ExtractValue(line, "policy_priority:"));
+          std::cout << "  Inference policy_priority: " << full_config.inference.policy_priority << std::endl;
+        }
+        else if (line.find("planner_priority:") != std::string::npos) {
+          full_config.inference.planner_priority =
+              NormalizePriority(ExtractValue(line, "planner_priority:"));
+          std::cout << "  Inference planner_priority: " << full_config.inference.planner_priority << std::endl;
         }
         else if (line.find("cpu_affinity:") != std::string::npos) {
           std::string affinity_str = ExtractValue(line, "cpu_affinity:");
@@ -601,6 +623,24 @@ private:
   static bool ExtractBoolValue(const std::string& line, const std::string& key) {
     std::string value = ExtractValue(line, key);
     return value == "true";  // Only "true" string evaluates to true
+  }
+
+  /**
+   * @brief Normalize a priority string from YAML to one of HIGH/NORMAL/LOW.
+   *
+   * Accepts mixed case ("high", "High", "HIGH"). Falls back to "NORMAL" with
+   * a warning if the value is empty or unrecognized.
+   */
+  static std::string NormalizePriority(const std::string& raw) {
+    std::string upper;
+    upper.reserve(raw.size());
+    for (char c : raw) upper.push_back(static_cast<char>(::toupper(static_cast<unsigned char>(c))));
+    if (upper == "HIGH" || upper == "NORMAL" || upper == "LOW") return upper;
+    if (!raw.empty()) {
+      std::cerr << "  Warning: Invalid model priority '" << raw
+                << "' — using NORMAL (allowed: HIGH, NORMAL, LOW)" << std::endl;
+    }
+    return "NORMAL";
   }
   
   /**

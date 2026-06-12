@@ -120,10 +120,13 @@ public:
      * @param device OpenVINO device string ("GPU", "CPU", "AUTO:GPU,CPU")
      * @param precision Inference precision hint
      * @param npu_tiles Number of NPU tiles to use (0 = auto/default, 1-N = specific count)
+     * @param model_priority OpenVINO model priority hint ("HIGH", "NORMAL", "LOW").
+     *                       Maps to ov::hint::model_priority in compile_model config.
      * @return true on success
      */
     bool Initialize(const std::string& modelPath, const std::string& device,
-                    Precision precision = Precision::FP32, int npu_tiles = 0);
+                    Precision precision = Precision::FP32, int npu_tiles = 0,
+                    const std::string& model_priority = "NORMAL");
 
     bool InitInputs(const AxisSizes& axisSizes = {});
     void Destroy();

@@ -100,10 +100,21 @@ bool OVInferenceEngine::Initialize(const std::string& modelPath, int /*deviceID*
 }
 
 // ============================================================================
+// Helper: Map priority string ("HIGH"/"NORMAL"/"LOW") to ov::hint::Priority.
+// Falls back to MEDIUM (NORMAL) for unrecognized values.
+// ============================================================================
+static ov::hint::Priority StringToOVPriority(const std::string& s) {
+    if (s == "HIGH") return ov::hint::Priority::HIGH;
+    if (s == "LOW")  return ov::hint::Priority::LOW;
+    return ov::hint::Priority::MEDIUM;  // "NORMAL" or unknown → MEDIUM (the default)
+}
+
+// ============================================================================
 // Initialize (extended, with device selection)
 // ============================================================================
 bool OVInferenceEngine::Initialize(const std::string& modelPath, const std::string& device,
-                                   Precision precision, int npu_tiles) {
+                                   Precision precision, int npu_tiles,
+                                   const std::string& model_priority) {
     try {
         std::cout << "[OVInference] Loading model: " << modelPath << std::endl;
         std::cout << "[OVInference] Requested device: " << device << std::endl;
@@ -138,6 +149,22 @@ bool OVInferenceEngine::Initialize(const std::string& modelPath, const std::stri
         }
         // Latency-optimized for real-time control
         config[ov::hint::performance_mode.name()] = ov::hint::PerformanceMode::LATENCY;
+
+        // Model priority: lets the OV scheduler arbitrate between models that share
+        // the same NPU (e.g. encoder + decoder contending for tiles on one NPU).
+        // Allowed strings: HIGH, NORMAL, LOW (mapped to ov::hint::Priority HIGH/MEDIUM/LOW).
+        // Note: only the NPU plugin supports MODEL_PRIORITY in this build —
+        // CPU and GPU plugins reject it with
+        // "Unsupported property MODEL_PRIORITY by <X> plugin".
+        // For non-NPU devices (e.g. planner on CPU) we skip the hint and let
+        // OpenVINO use its default scheduling.
+        if (is_npu) {
+          config[ov::hint::model_priority.name()] = StringToOVPriority(model_priority);
+          std::cout << "[OVInference] Model priority: " << model_priority << std::endl;
+        } else {
+          std::cout << "[OVInference] Model priority: ignored on " << device
+                    << " (NPU-only hint, using plugin default)" << std::endl;
+        }
 
         // Enable CPU pinning to reduce scheduling jitter on inference threads
         config[ov::hint::enable_cpu_pinning.name()] = true;

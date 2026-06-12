@@ -58,10 +58,12 @@ public:
    * @param use_fp16 Whether to use FP16 precision
    * @param device OpenVINO device string ("GPU", "CPU", "NPU", "AUTO:GPU,CPU")
    * @param npu_tiles Number of NPU tiles to use (0 = auto, 1-N = specific count)
+   * @param model_priority OpenVINO model priority ("HIGH", "NORMAL", "LOW")
    * @return true if initialization successful, false otherwise
    */
   bool Initialize(const std::string& model_path, bool use_fp16 = false,
-                  const std::string& device = "NPU", int npu_tiles = 0) {
+                  const std::string& device = "NPU", int npu_tiles = 0,
+                  const std::string& model_priority = "NORMAL") {
     if (model_path.empty()) {
       std::cerr << "✗ EncoderEngine::Initialize - Empty model path" << std::endl;
       return false;
@@ -93,7 +95,7 @@ public:
       // Initialize with device selection and tile configuration
       auto init_start = std::chrono::steady_clock::now();
       if (!inference_engine_->Initialize(model_file, device,
-              use_fp16 ? Precision::FP16 : Precision::FP32, npu_tiles)) {
+              use_fp16 ? Precision::FP16 : Precision::FP32, npu_tiles, model_priority)) {
         std::cerr << "✗ Failed to initialize encoder on " << device << ": " << model_file << std::endl;
         inference_engine_.reset();
         return false;
