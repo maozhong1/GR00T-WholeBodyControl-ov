@@ -41,7 +41,15 @@ struct Config {
     int warmup_iters = 100;  // skipped from min/max/avg stats
     bool decoder_only = false;
     bool yolo_only = false;
+    std::string decoder_priority = "NORMAL";  // HIGH | NORMAL | LOW
 };
+
+// Map priority string to ov::hint::Priority. NORMAL → MEDIUM (the OV default).
+ov::hint::Priority parse_priority(const std::string& s) {
+    if (s == "HIGH") return ov::hint::Priority::HIGH;
+    if (s == "LOW")  return ov::hint::Priority::LOW;
+    return ov::hint::Priority::MEDIUM;
+}
 
 void print_usage(const Config& cfg) {
     std::cout
@@ -58,6 +66,8 @@ void print_usage(const Config& cfg) {
         << cfg.warmup_iters << ")\n"
         << "  --decoder-only           Run only the Sonic decoder thread\n"
         << "  --yolo-only              Run only the YOLO perception thread\n"
+        << "  --decoder-priority <P>   Decoder model priority: HIGH|NORMAL|LOW (default: "
+        << cfg.decoder_priority << ")\n"
         << "  --help                   Show this help\n";
 }
 
@@ -82,6 +92,15 @@ Config parse_args(int argc, char* argv[]) {
         else if (a == "--warmup")          cfg.warmup_iters = std::stoi(next("--warmup"));
         else if (a == "--decoder-only")    cfg.decoder_only = true;
         else if (a == "--yolo-only")       cfg.yolo_only = true;
+        else if (a == "--decoder-priority") {
+            cfg.decoder_priority = next("--decoder-priority");
+            if (cfg.decoder_priority != "HIGH" && cfg.decoder_priority != "NORMAL" &&
+                cfg.decoder_priority != "LOW") {
+                std::cerr << "Invalid --decoder-priority: " << cfg.decoder_priority
+                          << " (expected HIGH, NORMAL, or LOW)\n";
+                std::exit(1);
+            }
+        }
         else if (a == "--help")            { print_usage(cfg); std::exit(0); }
         else {
             std::cerr << "Unknown argument: " << a << "\n";
@@ -223,7 +242,7 @@ void yolo_thread_fn(ov::Core& core, const Config& cfg, YoloStats& stats) {
             auto now = std::chrono::steady_clock::now();
             auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                   now - window_start).count();
-            if (elapsed_ms >= 1000) {
+            if (elapsed_ms >= 5000) {
                 double fps = window_frames * 1000.0 / static_cast<double>(elapsed_ms);
                 double avg_ms = window_frames ? (window_infer_us / 1000.0) / window_frames : 0.0;
                 std::cout << "[perception] FPS=" << std::fixed << std::setprecision(1) << fps
@@ -264,9 +283,11 @@ void decoder_thread_fn(ov::Core& core, const Config& cfg, DecoderStats& stats) {
         dev_cfg[ov::hint::performance_mode.name()] = ov::hint::PerformanceMode::THROUGHPUT;
         if (cfg.device.find("NPU") != std::string::npos) {
             dev_cfg["NPU_TILES"] = std::to_string(cfg.decoder_tiles);
+            dev_cfg[ov::hint::model_priority.name()] = parse_priority(cfg.decoder_priority);
         }
         std::cout << "[sonic] compiling on " << cfg.device
-                  << " (throughput hint, " << cfg.decoder_tiles << " tiles)\n";
+                  << " (throughput hint, " << cfg.decoder_tiles << " tiles, priority "
+                  << cfg.decoder_priority << ")\n";
         auto compiled = core.compile_model(model, cfg.device, dev_cfg);
         auto req = compiled.create_infer_request();
 
@@ -323,7 +344,7 @@ void decoder_thread_fn(ov::Core& core, const Config& cfg, DecoderStats& stats) {
             auto now = std::chrono::steady_clock::now();
             auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                   now - window_start).count();
-            if (elapsed_ms >= 1000) {
+            if (elapsed_ms >= 5000) {
                 double fps = window_frames * 1000.0 / static_cast<double>(elapsed_ms);
                 double avg_ms = window_frames ? (window_us / 1000.0) / window_frames : 0.0;
                 std::cout << "[sonic] FPS=" << std::fixed << std::setprecision(1) << fps
@@ -365,6 +386,7 @@ int main(int argc, char* argv[]) {
               << "  device:         " << cfg.device << "\n"
               << "  yolo-tiles:     " << cfg.yolo_tiles << "\n"
               << "  decoder-tiles:  " << cfg.decoder_tiles << "\n"
+              << "  decoder-prio:   " << cfg.decoder_priority << "\n"
               << "  yolo-fps:       " << cfg.yolo_fps << "\n"
               << "  warmup:         " << cfg.warmup_iters << " iters\n"
               << "  duration:       " << cfg.duration_sec << " s ("
