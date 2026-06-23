@@ -42,6 +42,7 @@ struct Config {
     bool decoder_only = false;
     bool yolo_only = false;
     std::string decoder_priority = "NORMAL";  // HIGH | NORMAL | LOW
+    bool npu_turbo = false;  // sets NPU_TURBO on both compile_model calls when on NPU
 };
 
 // Map priority string to ov::hint::Priority. NORMAL → MEDIUM (the OV default).
@@ -68,6 +69,7 @@ void print_usage(const Config& cfg) {
         << "  --yolo-only              Run only the YOLO perception thread\n"
         << "  --decoder-priority <P>   Decoder model priority: HIGH|NORMAL|LOW (default: "
         << cfg.decoder_priority << ")\n"
+        << "  --npu-turbo              Enable NPU turbo mode (NPU only, default: off)\n"
         << "  --help                   Show this help\n";
 }
 
@@ -101,6 +103,7 @@ Config parse_args(int argc, char* argv[]) {
                 std::exit(1);
             }
         }
+        else if (a == "--npu-turbo")       cfg.npu_turbo = true;
         else if (a == "--help")            { print_usage(cfg); std::exit(0); }
         else {
             std::cerr << "Unknown argument: " << a << "\n";
@@ -180,9 +183,11 @@ void yolo_thread_fn(ov::Core& core, const Config& cfg, YoloStats& stats) {
         dev_cfg[ov::hint::performance_mode.name()] = ov::hint::PerformanceMode::THROUGHPUT;
         if (cfg.device.find("NPU") != std::string::npos) {
             dev_cfg["NPU_TILES"] = std::to_string(cfg.yolo_tiles);
+            dev_cfg["NPU_TURBO"] = cfg.npu_turbo ? "YES" : "NO";
         }
         std::cout << "[perception] compiling on " << cfg.device
-                  << " (throughput, " << cfg.yolo_tiles << " tiles)\n";
+                  << " (throughput, " << cfg.yolo_tiles << " tiles, turbo "
+                  << (cfg.npu_turbo ? "ON" : "OFF") << ")\n";
         auto compiled = core.compile_model(model, cfg.device, dev_cfg);
         auto req = compiled.create_infer_request();
 
@@ -284,10 +289,12 @@ void decoder_thread_fn(ov::Core& core, const Config& cfg, DecoderStats& stats) {
         if (cfg.device.find("NPU") != std::string::npos) {
             dev_cfg["NPU_TILES"] = std::to_string(cfg.decoder_tiles);
             dev_cfg[ov::hint::model_priority.name()] = parse_priority(cfg.decoder_priority);
+            dev_cfg["NPU_TURBO"] = cfg.npu_turbo ? "YES" : "NO";
         }
         std::cout << "[sonic] compiling on " << cfg.device
                   << " (throughput hint, " << cfg.decoder_tiles << " tiles, priority "
-                  << cfg.decoder_priority << ")\n";
+                  << cfg.decoder_priority << ", turbo "
+                  << (cfg.npu_turbo ? "ON" : "OFF") << ")\n";
         auto compiled = core.compile_model(model, cfg.device, dev_cfg);
         auto req = compiled.create_infer_request();
 
@@ -387,6 +394,7 @@ int main(int argc, char* argv[]) {
               << "  yolo-tiles:     " << cfg.yolo_tiles << "\n"
               << "  decoder-tiles:  " << cfg.decoder_tiles << "\n"
               << "  decoder-prio:   " << cfg.decoder_priority << "\n"
+              << "  npu-turbo:      " << (cfg.npu_turbo ? "ON" : "OFF") << "\n"
               << "  yolo-fps:       " << cfg.yolo_fps << "\n"
               << "  warmup:         " << cfg.warmup_iters << " iters\n"
               << "  duration:       " << cfg.duration_sec << " s ("
