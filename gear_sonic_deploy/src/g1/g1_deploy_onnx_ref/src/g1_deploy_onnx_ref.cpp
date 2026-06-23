@@ -375,6 +375,10 @@ class G1Deploy {
     CumulativeStats obs_duration_stats_;
     CumulativeStats policy_duration_stats_;
     CumulativeStats obs_to_motor_cmd_duration_stats_;
+    // Planner model inference latency stats. Pushed from the 10 Hz planner
+    // thread, read from the 50 Hz control thread for logging — guarded by mutex.
+    CumulativeStats planner_model_duration_stats_;
+    std::mutex planner_model_duration_stats_mutex_;
     std::unique_ptr<AudioThread> audio_thread_;
     
     // =========================================================================
@@ -3799,6 +3803,10 @@ class G1Deploy {
               obs_duration_stats_.reset();
               policy_duration_stats_.reset();
               obs_to_motor_cmd_duration_stats_.reset();
+              {
+                std::lock_guard<std::mutex> lock(planner_model_duration_stats_mutex_);
+                planner_model_duration_stats_.reset();
+              }
               planner_warmup_remaining_ = kPlannerWarmupTicks;
               std::cout << "[Stats] Reset inference timing stats after planner init (skipping "
                         << kPlannerWarmupTicks << " warmup ticks)" << std::endl;
@@ -3962,7 +3970,16 @@ class G1Deploy {
               )) {
                 throw std::runtime_error("Error when updating planner");
               }
-              
+
+              // Accumulate planner model inference latency (skip during warmup
+              // window so the one-time NPU compile/load spike doesn't skew max).
+              if (planner_warmup_remaining_ <= 0) {
+                std::lock_guard<std::mutex> lock(planner_model_duration_stats_mutex_);
+                planner_model_duration_stats_.push(
+                    static_cast<double>(planner_->last_timing_.model_duration.count()));
+              }
+
+
             } catch (const std::exception& e) {
               std::cout << "✗ Error during planning update: " << e.what() << std::endl;
               std::cout << "Disabling planner to prevent further errors..." << std::endl;
@@ -4312,8 +4329,20 @@ class G1Deploy {
             
             // Add planner timing if planner is enabled and initialized
             if (planner_ && planner_->planner_state_.enabled && planner_->planner_state_.initialized) {
+              int planner_model_avg = 0, planner_model_min = 0, planner_model_p99 = 0, planner_model_max = 0;
+              {
+                std::lock_guard<std::mutex> lock(planner_model_duration_stats_mutex_);
+                planner_model_avg = static_cast<int>(planner_model_duration_stats_.mean());
+                planner_model_min = static_cast<int>(planner_model_duration_stats_.min());
+                planner_model_p99 = static_cast<int>(planner_model_duration_stats_.percentile(0.99));
+                planner_model_max = static_cast<int>(planner_model_duration_stats_.max());
+              }
               std::cout << ", Planner - Gather Input: " << planner_->last_timing_.gather_input_duration.count() << "us"
                         << ", Model: " << planner_->last_timing_.model_duration.count() << "us"
+                        << " (avg:" << planner_model_avg
+                        << " min:" << planner_model_min
+                        << " P99:" << planner_model_p99
+                        << " max:" << planner_model_max << ")"
                         << ", Convert50Hz: " << planner_->last_timing_.extract_duration.count() << "us"
                         << ", Total: " << planner_->last_timing_.total_duration.count() << "us";
             }
