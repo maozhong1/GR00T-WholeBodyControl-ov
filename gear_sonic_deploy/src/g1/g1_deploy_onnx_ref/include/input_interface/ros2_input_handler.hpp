@@ -378,11 +378,26 @@ public:
             //              robot holds in place — the deploy does NOT exit).
             //   3rd pulse: paused → RESUME navigation (no re-init: planner is still up).
             //
+            //   Special case: if we are currently in VLA mode (vla_mode_active_),
+            //   a toggle_policy_action pulse means "navigate wants to take back
+            //   control". We treat it as an implicit EXIT-VLA edge: clear the
+            //   VLA flags and drop into the safety-reset path so the planner
+            //   re-initialises exactly as it would on toggle_vla_mode=falling.
+            //
             // The previous semantic ("2nd pulse → operator_state.stop=true → deploy exits")
             // was unsuitable for the navigate ↔ VLA mode-switch use case where we want
             // to come back later. Emergency stop is still available via the 'O'/'o' key.
             if (control_goal_buffer_.toggle_policy_action) {
-                if (!control_is_active_) {
+                if (vla_mode_active_.load()) {
+                    // Implicit EXIT VLA: nav is taking back control.
+                    vla_mode_active_.store(false);
+                    pause_navigation_ = false;
+                    trigger_safety_reset = true;
+                    if constexpr (DEBUG_LOGGING) {
+                        std::cout << "[VLA Mode] EXIT  (toggle_policy_action while in VLA): "
+                                     "nav reclaiming control via safety reset" << std::endl;
+                    }
+                } else if (!control_is_active_) {
                     control_is_active_ = true;
                     start_control_ = true;
                     pause_navigation_ = false;
@@ -634,6 +649,18 @@ public:
                 // GetExternalTokenState(); also park navigation so the
                 // planner's IDLE/decay output never fights the VLA action.
                 pause_navigation_ = true;
+
+                // toggle_vla_mode is itself an operator intent to drive
+                // the robot, so auto-START control if it isn't already
+                // armed — no separate toggle_policy_action pulse needed.
+                // (Mirrors the behaviour of toggle_policy_action's 1st pulse.)
+                if (!control_is_active_) {
+                    control_is_active_ = true;
+                    start_control_ = true;
+                    std::cout << "[VLA Mode] auto-START control "
+                                 "(toggle_vla_mode while control was idle)" << std::endl;
+                }
+
                 std::cout << "[VLA Mode] ENTER (toggle_vla_mode rising edge): "
                              "external tokens drive decoder; navigation paused" << std::endl;
             } else {
