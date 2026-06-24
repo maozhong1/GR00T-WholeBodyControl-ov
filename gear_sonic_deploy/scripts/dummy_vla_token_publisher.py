@@ -52,6 +52,7 @@ CLI:
 """
 import argparse
 import json
+import signal
 import struct
 import threading
 import time
@@ -185,6 +186,16 @@ def main():
     spin_thread = threading.Thread(target=rclpy.spin, args=(node,), daemon=True)
     spin_thread.start()
 
+    # rclpy installs its own SIGINT handler that flips rclpy.ok() → False but does
+    # NOT raise KeyboardInterrupt on the main thread. Install our own handler
+    # AFTER rclpy.init() so the publish loop can exit cleanly via a flag and
+    # we get a chance to fire the EXIT-VLA toggle before shutting down.
+    shutdown_requested = [False]
+    def _on_signal(signum, frame):
+        shutdown_requested[0] = True
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
+
     rng = np.random.default_rng(0)
     period = 1.0 / args.rate
     t0 = time.monotonic()
@@ -211,7 +222,7 @@ def main():
         node.get_logger().info("Will send toggle_vla_mode=True (EXIT VLA) on Ctrl+C")
 
     try:
-        while rclpy.ok():
+        while rclpy.ok() and not shutdown_requested[0]:
             t = time.monotonic() - t0
             token = make_token(args.token_mode, args.token_dim, t, rng)
             left_hand = make_hand(t)
@@ -243,21 +254,32 @@ def main():
 
             time.sleep(period)
     except KeyboardInterrupt:
-        if args.toggle_on_exit:
-            node.get_logger().info("Sending toggle_vla_mode=True (EXIT VLA) before shutdown")
+        # Belt-and-suspenders: also catch the rare case where the interpreter
+        # does manage to raise KeyboardInterrupt (e.g. signal arrives between
+        # bytecodes during a slow operation).
+        shutdown_requested[0] = True
+    finally:
+        if args.toggle_on_exit and shutdown_requested[0]:
+            node.get_logger().info(
+                "Shutdown requested — sending toggle_vla_mode=True (EXIT VLA) before shutdown"
+            )
             zero_token = np.zeros(args.token_dim, dtype=np.float32)
             zero_hand = np.zeros(7, dtype=np.float32) if args.with_hand_joints else None
-            pub.publish(
-                to_byte_multi_array(
-                    build_packed_payload(
-                        zero_token, True, msg_count,
-                        left_hand=zero_hand, right_hand=zero_hand,
+            try:
+                pub.publish(
+                    to_byte_multi_array(
+                        build_packed_payload(
+                            zero_token, True, msg_count,
+                            left_hand=zero_hand, right_hand=zero_hand,
+                        )
                     )
                 )
-            )
-            time.sleep(0.2)
+                # Give DDS / rclcpp executor time to actually transmit before we
+                # tear the node down — without this the message gets dropped.
+                time.sleep(0.3)
+            except Exception as e:
+                node.get_logger().warning(f"Failed to publish EXIT toggle: {e}")
         node.get_logger().info("Interrupted, shutting down.")
-    finally:
         node.destroy_node()
         rclpy.shutdown()
 
