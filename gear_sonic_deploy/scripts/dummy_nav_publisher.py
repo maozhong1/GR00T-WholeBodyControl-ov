@@ -32,19 +32,20 @@ CLI:
     --locomotion-mode  0 = slow walk, 1 = fast walk (default 1)
     --pattern NAME     square | forward | turn | manual (default square)
     --segment SEC      Phase duration for `square` / `forward` / `turn` patterns (default 5.0)
-    --auto-start       Pulse `toggle_policy_action` at t=2s to auto-trigger control
-    --toggle-initial   Initial-pulse delay in seconds (default 2.0; only used if --auto-start)
+    --toggle-initial   Send `toggle_policy_action`=True at t=N seconds (default 2.0).
+                       Pass -1 to disable the auto-pulse entirely.
     --toggle-interval  Re-pulse `toggle_policy_action` every N seconds (default 0 = disabled)
     --max-toggles      Stop pulsing after N pulses (default 0 = unlimited)
+    --auto-start       Legacy alias (no longer required — the auto-pulse is now
+                       driven by --toggle-initial alone).
     --verbose          Log every published message instead of every 10
 
-NOTE on toggle semantics: `toggle_policy_action` is edge-triggered AND
-*toggles* between START and STOP on each pulse. The 1st pulse starts
-control; the 2nd stops it; the 3rd restarts; …  By default we send a
-single pulse only. Pass `--toggle-interval N` (>0) to re-fire every N
-seconds — useful for a deploy that starts AFTER this publisher — but
-remember to disable it once deploy logs 'START control', otherwise the
-next pulse will STOP control again.
+NOTE on toggle semantics (after the deploy-side fix in
+ros2_input_handler.hpp): `toggle_policy_action` is edge-triggered. The 1st
+pulse STARTs control; the 2nd PAUSEs navigation in place (planner stays
+enabled, robot holds — does NOT stop the deploy); the 3rd RESUMEs; …  By
+default we send a single pulse only. Pass `--toggle-interval N` (>0) to
+re-fire every N seconds — useful when deploy starts AFTER this publisher.
 """
 import argparse
 import threading
@@ -132,9 +133,10 @@ def main():
                    help="Command pattern over time")
     p.add_argument("--segment", type=float, default=5.0, help="Phase duration (s) for time-varying patterns")
     p.add_argument("--auto-start", action="store_true",
-                   help="Pulse toggle_policy_action=True (replaces manual operator 'start')")
+                   help="(legacy alias, kept for backward compat; behaviour is now driven by --toggle-initial)")
     p.add_argument("--toggle-initial", type=float, default=2.0,
-                   help="Delay before first toggle pulse (s). Only used when --auto-start is set.")
+                   help="Send first toggle_policy_action=True at t=N seconds (default 2.0). "
+                        "Set to -1 to disable the auto-pulse (operator must START control by other means).")
     p.add_argument("--toggle-interval", type=float, default=0.0,
                    help="Re-pulse every N seconds (default 0 = single pulse only). "
                         "WARNING: each pulse FLIPS start<->stop, so a late deploy catching a 2nd pulse "
@@ -164,7 +166,10 @@ def main():
     period = 1.0 / args.rate
     t0 = time.monotonic()
     msg_count = 0
-    next_toggle_t = args.toggle_initial if args.auto_start else None
+    # Auto-pulse is on whenever --toggle-initial is non-negative. Passing
+    # --auto-start without --toggle-initial keeps the legacy default of 2.0s.
+    auto_pulse = (args.toggle_initial is not None and args.toggle_initial >= 0)
+    next_toggle_t = args.toggle_initial if auto_pulse else None
     toggle_count = 0
 
     node.get_logger().info(
@@ -172,9 +177,9 @@ def main():
         f"vx={args.vx} vy={args.vy} wz={args.wz} "
         f"base_height={args.base_height} locomotion_mode={args.locomotion_mode}"
     )
-    if args.auto_start:
+    if auto_pulse:
         node.get_logger().info(
-            f"auto-start: first toggle at t={args.toggle_initial:.1f}s; "
+            f"auto-pulse: first toggle at t={args.toggle_initial:.1f}s; "
             f"re-pulse every {args.toggle_interval:.1f}s "
             f"(0 = once); max_toggles={args.max_toggles or 'unlimited'}"
         )
