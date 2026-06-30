@@ -293,80 +293,54 @@ class G1Deploy {
     static constexpr std::chrono::milliseconds STREAMING_DATA_ABSENT_THRESHOLD{150};
     CounterDebouncer streaming_data_absent_debouncer_{100, 500, 50, 1};
     RollingStats<1000> streaming_data_delay_rolling_stats_;
-    // Cumulative stats for inference timing (in microseconds, whole test duration).
-    // Uses Welford's online algorithm — no sum accumulation, so no overflow or
-    // floating-point precision loss regardless of run duration.
-    // The first kWarmupTicks are ignored to exclude model loading / NPU warm-up spikes.
-    // Uses a 5-minute sliding window for percentile (P99) computation so that
-    // stats reflect recent behavior rather than all-time history.
+    // Cumulative stats for inference timing (in microseconds).
+    // Stores every sample since the last reset() so P99 is exact. Reset is
+    // called on mode change (e.g. reference-motion → planner) and after planner
+    // init, so the sample buffer stays bounded in practice (one mode session).
+    // The first kWarmupTicks ticks of the whole run are ignored to skip the
+    // initial NPU model-compile spike; kPlannerWarmupTicks more are ignored
+    // after planner init for steady-state numbers.
     static constexpr int kWarmupTicks = 100;  // Skip first 100 ticks for stats
-    static constexpr int kPlannerWarmupTicks = 50;  // Skip 50 ticks after planner init
+    static constexpr int kPlannerWarmupTicks = 10;  // Skip 10 ticks after planner init
     int planner_warmup_remaining_ = 0;  // Countdown after planner init
     struct CumulativeStats {
-      // Sliding window size: 5 minutes at 50 Hz = 15000 samples.
-      static constexpr size_t kWindowSize = 15000;
-      std::vector<double> window_;
-      size_t write_pos_ = 0;
-      bool window_full_ = false;
-      bool window_sorted_ = false;
-      std::vector<double> sorted_cache_;
-
+      std::vector<double> samples_;
       double min_ = std::numeric_limits<double>::max();
       double max_ = 0.0;
       double sum_ = 0.0;
+      bool sorted_ = false;
+      std::vector<double> sorted_cache_;
 
       double mean() const {
-        size_t n = window_full_ ? kWindowSize : write_pos_;
-        return n > 0 ? sum_ / static_cast<double>(n) : 0.0;
+        return samples_.empty() ? 0.0 : sum_ / static_cast<double>(samples_.size());
       }
-      double min() const { return write_pos_ > 0 || window_full_ ? min_ : 0.0; }
+      double min() const { return samples_.empty() ? 0.0 : min_; }
       double max() const { return max_; }
 
-      // Return the value at the given percentile (0.0–1.0) over the sliding window.
+      // Exact percentile (0.0–1.0) over all samples accumulated since last reset.
       double percentile(double p) {
-        size_t n = window_full_ ? kWindowSize : write_pos_;
-        if (n == 0) return 0.0;
-        if (!window_sorted_) {
-          sorted_cache_.assign(window_.begin(), window_.begin() + static_cast<ptrdiff_t>(n));
+        if (samples_.empty()) return 0.0;
+        if (!sorted_) {
+          sorted_cache_ = samples_;
           std::sort(sorted_cache_.begin(), sorted_cache_.end());
-          window_sorted_ = true;
+          sorted_ = true;
         }
         size_t idx = static_cast<size_t>(p * static_cast<double>(sorted_cache_.size() - 1));
         return sorted_cache_[idx];
       }
 
       void push(double v) {
-        size_t n = window_full_ ? kWindowSize : write_pos_;
-
-        // Subtract the sample being evicted from the running sum.
-        if (window_full_) {
-          sum_ -= window_[write_pos_];
-        }
+        samples_.push_back(v);
         sum_ += v;
-
-        // Write into the circular buffer.
-        if (window_.size() < kWindowSize) {
-          window_.push_back(v);
-        } else {
-          window_[write_pos_] = v;
-        }
-        write_pos_ = (write_pos_ + 1) % kWindowSize;
-        if (write_pos_ == 0 && !window_full_) window_full_ = true;
-
-        // Recompute min/max over the window (cheap for 3000 elements).
-        n = window_full_ ? kWindowSize : write_pos_;
-        min_ = *std::min_element(window_.begin(), window_.begin() + static_cast<ptrdiff_t>(n));
-        max_ = *std::max_element(window_.begin(), window_.begin() + static_cast<ptrdiff_t>(n));
-
-        window_sorted_ = false;
+        if (v < min_) min_ = v;
+        if (v > max_) max_ = v;
+        sorted_ = false;
       }
 
       void reset() {
-        window_.clear();
-        write_pos_ = 0;
-        window_full_ = false;
-        window_sorted_ = false;
+        samples_.clear();
         sorted_cache_.clear();
+        sorted_ = false;
         min_ = std::numeric_limits<double>::max();
         max_ = 0.0;
         sum_ = 0.0;
@@ -422,16 +396,6 @@ class G1Deploy {
     
     // Independent logging counter (not affected by planner buffer cleaning)
     int logging_counter_ = 0;
-
-    // Dump the per-motor MotorCmd_ subcommand fields (mode/q/dq/tau/kp/kd)
-    // once every 10 seconds (0.1 Hz), taken from inside LowCommandWriter()
-    // right before the DDS Write, i.e. exactly the bytes that go on the wire
-    // to MuJoCo. The publish loop runs at 500 Hz, so a decimation of 5000
-    // yields exactly one dump per 10 seconds.
-    static constexpr int kPublishHz = 500;
-    static constexpr int kDecoderDumpPeriodSec = 10;
-    static constexpr int kDecoderDumpDecimation = kPublishHz * kDecoderDumpPeriodSec;
-    int decoder_dump_counter_ = 0;
 
     TimestampedData<LowState_> used_low_state_data_;
     TimestampedData<IMUState_> used_imu_torso_data_;
@@ -1750,7 +1714,7 @@ class G1Deploy {
       static int gather_token_log_counter_ = 0;
       if (!is_using_encoder_) {
         // No encoder configured; use token_state_data_ (can be set externally via ROS2/ZMQ)
-        if (gather_token_log_counter_++ % 500 == 0) {
+        if (gather_token_log_counter_++ % 250 == 0) {
           std::cout << "[TokenState] Using EXTERNAL tokens (encoder NOT active), tokens[0]="
                     << token_state_data_[0] << std::endl;
         }
@@ -1776,7 +1740,7 @@ class G1Deploy {
         return false;
       }
       auto encoder_end = std::chrono::steady_clock::now();
-      if (gather_token_log_counter_++ % 500 == 0) {
+      if (gather_token_log_counter_++ % 250 == 0) {
         auto encoder_us = std::chrono::duration_cast<std::chrono::microseconds>(encoder_end - encoder_start).count();
         std::cout << "[TokenState] Using LOCAL ENCODER inference (" << encoder_us << " us)" << std::endl;
       }
@@ -2527,9 +2491,7 @@ class G1Deploy {
         planner_config.device = inference_config.planner_device;
         planner_config.npu_tiles = inference_config.planner_npu_tiles;
         planner_config.model_priority = inference_config.planner_priority;
-        planner_config.dump_input_csv = inference_config.dump_planner_input;
-        planner_config.max_input_dump_cnt = inference_config.max_input_dump_cnt;
-        planner_config.dump_csv_path = inference_config.dump_csv_path;
+        planner_config.log_summary = inference_config.planner_log_summary;
         planner_ = std::make_unique<LocalMotionPlannerTensorRT>(planner_fp16, 0, planner_config);
       }
       
@@ -2791,43 +2753,6 @@ class G1Deploy {
         }
 
         dds_low_command.crc() = Crc32Core((uint32_t*)&dds_low_command, (sizeof(dds_low_command) >> 2) - 1);
-
-        // 0.1 Hz (every 10 s) dump of the full per-motor DDS subcommand
-        // (MotorCmd_ fields) immediately before publishing, so the printout
-        // matches the wire bytes. Off by default; enable with the
-        // DUMP_SUBCMD env var ("1"/"true"/"on"/"yes"), e.g.
-        //   DUMP_SUBCMD=1 bash deploy.sh sim
-        static const bool kDumpSubCmdEnabled = []() {
-          const char* v = std::getenv("DUMP_SUBCMD");
-          if (!v) return false;
-          std::string s(v);
-          std::transform(s.begin(), s.end(), s.begin(),
-                         [](unsigned char c) { return std::tolower(c); });
-          return s == "1" || s == "true" || s == "on" || s == "yes";
-        }();
-        if (kDumpSubCmdEnabled &&
-            (decoder_dump_counter_++ % kDecoderDumpDecimation) == 0) {
-          std::ostringstream oss;
-          oss.setf(std::ios::fixed);
-          oss.precision(6);
-          oss << "[MotorCmdDump] mode_pr=" << static_cast<int>(dds_low_command.mode_pr())
-              << " mode_machine=" << static_cast<int>(dds_low_command.mode_machine())
-              << " crc=0x" << std::hex << dds_low_command.crc() << std::dec << "\n";
-          for (size_t i = 0; i < G1_NUM_MOTOR; ++i) {
-            const auto& m = dds_low_command.motor_cmd().at(i);
-            oss << "  [" << std::setw(2) << i << "]"
-                << " mode=" << static_cast<int>(m.mode())
-                << " q=" << m.q()
-                << " dq=" << m.dq()
-                << " tau=" << m.tau()
-                << " kp=" << m.kp()
-                << " kd=" << m.kd()
-                << " reserve=" << m.reserve()
-                << "\n";
-          }
-          std::cout << oss.str() << std::flush;
-        }
-
         lowcmd_publisher_->Write(dds_low_command);
       }
 
@@ -3448,6 +3373,20 @@ class G1Deploy {
             idle_readapt_stored_ = false;
             if(is_the_first_time) {
               reinitialize_heading_ = true;
+
+              // Reference-motion → planner mode switch: reset inference stats
+              // so percentile/avg reflect planner-mode steady state, and skip
+              // the next kPlannerWarmupTicks ticks to ignore the transient.
+              obs_duration_stats_.reset();
+              policy_duration_stats_.reset();
+              obs_to_motor_cmd_duration_stats_.reset();
+              {
+                std::lock_guard<std::mutex> lock(planner_model_duration_stats_mutex_);
+                planner_model_duration_stats_.reset();
+              }
+              planner_warmup_remaining_ = kPlannerWarmupTicks;
+              std::cout << "[Stats] Reset inference timing stats on planner-mode entry (skipping "
+                        << kPlannerWarmupTicks << " warmup ticks)" << std::endl;
             }
           }
         }

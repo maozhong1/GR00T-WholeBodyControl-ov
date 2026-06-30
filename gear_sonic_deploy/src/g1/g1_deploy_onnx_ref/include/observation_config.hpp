@@ -107,9 +107,7 @@ struct EncoderConfig {
  *   policy_priority: "NORMAL"  # OpenVINO model priority (HIGH, NORMAL, LOW)
  *   planner_priority: "NORMAL" # OpenVINO model priority (HIGH, NORMAL, LOW)
  *   cpu_affinity: 2          # Pin inference/control thread to this CPU core (-1 = no pinning)
- *   dump_planner_input: false # Enable CSV dump of planner inputs for accuracy validation
- *   max_input_dump_cnt: 100  # Max rows to dump (0 = unlimited)
- *   dump_csv_path: "planner_input_dump.csv"
+ *   planner_log_summary: false # Periodic [Planner] inference summary (latency, NaN/Inf check, mode)
  * ```
  */
 struct InferenceConfig {
@@ -123,9 +121,7 @@ struct InferenceConfig {
   std::string policy_priority = "NORMAL";  ///< OV model priority for policy ("HIGH", "NORMAL", "LOW")
   std::string planner_priority = "NORMAL"; ///< OV model priority for planner ("HIGH", "NORMAL", "LOW")
   int cpu_affinity = -1;                ///< CPU core to pin inference thread to (-1 = no pinning)
-  bool dump_planner_input = false;      ///< Enable CSV dump of planner inputs for accuracy validation
-  int max_input_dump_cnt = 100;         ///< Max number of planner input rows to dump (0 = unlimited)
-  std::string dump_csv_path = "planner_input_dump.csv";  ///< Path for the planner input CSV dump file
+  bool planner_log_summary = false;     ///< Enable periodic [Planner] inference summary log (NaN/Inf check + latency)
 };
 
 /**
@@ -289,22 +285,9 @@ public:
             std::cerr << "  Warning: Invalid cpu_affinity value: " << affinity_str << std::endl;
           }
         }
-        else if (line.find("dump_planner_input:") != std::string::npos) {
-          full_config.inference.dump_planner_input = ExtractBoolValue(line, "dump_planner_input:");
-          std::cout << "  Inference dump_planner_input: " << (full_config.inference.dump_planner_input ? "true" : "false") << std::endl;
-        }
-        else if (line.find("max_input_dump_cnt:") != std::string::npos) {
-          std::string cnt_str = ExtractValue(line, "max_input_dump_cnt:");
-          try {
-            full_config.inference.max_input_dump_cnt = std::stoi(cnt_str);
-            std::cout << "  Inference max_input_dump_cnt: " << full_config.inference.max_input_dump_cnt << std::endl;
-          } catch (...) {
-            std::cerr << "  Warning: Invalid max_input_dump_cnt value: " << cnt_str << std::endl;
-          }
-        }
-        else if (line.find("dump_csv_path:") != std::string::npos) {
-          full_config.inference.dump_csv_path = ExtractValue(line, "dump_csv_path:");
-          std::cout << "  Inference dump_csv_path: " << full_config.inference.dump_csv_path << std::endl;
+        else if (line.find("planner_log_summary:") != std::string::npos) {
+          full_config.inference.planner_log_summary = ExtractBoolValue(line, "planner_log_summary:");
+          std::cout << "  Inference planner_log_summary: " << (full_config.inference.planner_log_summary ? "true" : "false") << std::endl;
         }
         continue;
       }

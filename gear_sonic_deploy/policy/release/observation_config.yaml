@@ -101,8 +101,7 @@ inference:
   # use 'echo 10 | sudo tee /proc/irq/189/smp_affinity_list' to set vpu interrupt affitiy
   # to reduce jitter in case NPU sync inference.
   cpu_affinity: 10
-  # Dump planner model inputs to CSV for NPU accuracy validation.
-  # Set to true to enable, max_input_dump_cnt limits the number of rows (0 = unlimited).
-  dump_planner_input: flase
-  max_input_dump_cnt: 200
-  dump_csv_path: "planner_input_dump.csv"
+  # Emit a periodic "[Planner] Inference #N | latency | NaN/Inf check | mode/vel/dir"
+  # summary line (every 10th planner inference, ~1 Hz on the 10 Hz planner thread).
+  # Off by default — turn on for accuracy/sanity checking, leave off in production.
+  planner_log_summary: false

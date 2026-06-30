@@ -26,10 +26,8 @@
 
 #include "inference_backend.hpp"
 #include <iostream>
-#include <fstream>
 #include <chrono>
 #include <cmath>
-#include <iomanip>
 #include "localmotion_kplanner.hpp"
 
 /**
@@ -128,85 +126,6 @@ private:
     // ------------------------------------------------------------------
     uint64_t planner_infer_count_ = 0;
     uint64_t planner_latency_sum_us_ = 0;
-
-    // ------------------------------------------------------------------
-    // CSV dump for accuracy validation
-    // ------------------------------------------------------------------
-    bool csv_header_written_ = false;
-    uint64_t csv_dump_count_ = 0;
-
-    /**
-     * @brief Dump all planner input tensors to CSV for NPU accuracy validation.
-     *
-     * Controlled by config_.dump_input_csv (enable/disable) and
-     * config_.max_input_dump_cnt (max rows, 0 = unlimited).
-     *
-     * Each row = one inference call. Columns:
-     *   timestamp_us, mode[1], target_vel[1], target_height[1],
-     *   movement_direction[3], facing_direction[3], random_seed[1],
-     *   has_specific_target[1], specific_target_positions[12],
-     *   specific_target_headings[4], allowed_pred_num_tokens[11],
-     *   context_mujoco_qpos[144]
-     */
-    void DumpInputsToCSV() {
-        if (!config_.dump_input_csv) return;
-        if (config_.max_input_dump_cnt > 0 &&
-            csv_dump_count_ >= static_cast<uint64_t>(config_.max_input_dump_cnt)) return;
-
-        std::ofstream csv;
-        if (!csv_header_written_) {
-            csv.open(config_.dump_csv_path, std::ios::out | std::ios::trunc);
-            if (!csv.is_open()) {
-                std::cerr << "[Planner] ⚠ Cannot open CSV dump file: " << config_.dump_csv_path << std::endl;
-                return;
-            }
-            // Write header
-            csv << "infer_count,timestamp_us";
-            csv << ",mode(shape=1;dtype=int64)";
-            csv << ",target_vel(shape=1;dtype=float)";
-            csv << ",target_height(shape=1;dtype=float)";
-            for (int i = 0; i < 3; ++i) csv << ",movement_direction_" << i << "(shape=3;dtype=float)";
-            for (int i = 0; i < 3; ++i) csv << ",facing_direction_" << i << "(shape=3;dtype=float)";
-            csv << ",random_seed(shape=1;dtype=int64)";
-            csv << ",has_specific_target(shape=1;dtype=int64)";
-            for (int i = 0; i < 12; ++i) csv << ",specific_target_positions_" << i << "(shape=1x4x3;dtype=float)";
-            for (int i = 0; i < 4; ++i) csv << ",specific_target_headings_" << i << "(shape=1x4;dtype=float)";
-            for (int i = 0; i < 11; ++i) csv << ",allowed_pred_num_tokens_" << i << "(shape=1x11;dtype=int64)";
-            for (int i = 0; i < 4 * (G1_NUM_MOTOR + 7); ++i)
-                csv << ",context_mujoco_qpos_" << i << "(shape=1x4x36;dtype=float)";
-            csv << "\n";
-            csv_header_written_ = true;
-        } else {
-            csv.open(config_.dump_csv_path, std::ios::out | std::ios::app);
-            if (!csv.is_open()) return;
-        }
-
-        auto now = std::chrono::steady_clock::now().time_since_epoch();
-        auto ts_us = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
-
-        csv << std::setprecision(8);
-        csv << planner_infer_count_ << "," << ts_us;
-        csv << "," << mode_values_[0];
-        csv << "," << target_vel_values_[0];
-        csv << "," << target_height_values_[0];
-        for (int i = 0; i < 3; ++i) csv << "," << movement_direction_values_[i];
-        for (int i = 0; i < 3; ++i) csv << "," << facing_direction_values_[i];
-        csv << "," << random_seed_values_[0];
-        csv << "," << has_specific_target_[0];
-        for (int i = 0; i < 12; ++i) csv << "," << specific_target_positions_[i];
-        for (int i = 0; i < 4; ++i) csv << "," << specific_target_headings_[i];
-        for (int i = 0; i < 11; ++i) csv << "," << allowed_pred_num_tokens_[i];
-        for (size_t i = 0; i < context_qpos_values_.size(); ++i) csv << "," << context_qpos_values_[i];
-        csv << "\n";
-        csv.close();
-        csv_dump_count_++;
-
-        if (config_.max_input_dump_cnt > 0 &&
-            csv_dump_count_ >= static_cast<uint64_t>(config_.max_input_dump_cnt)) {
-            std::cout << "[Planner] CSV dump reached max count (" << config_.max_input_dump_cnt
-                      << "), stopping dump." << std::endl;
-        }
-    }
 
     /// Named tensor identifiers.
     struct TensorNames {
@@ -383,9 +302,6 @@ private:
             inference_engine_->SetInputData(tensor_names_.allowed_pred_num_tokens, allowed_pred_num_tokens_);
         }
 
-        // Dump inputs to CSV for NPU accuracy validation
-        DumpInputsToCSV();
-
         if (!inference_engine_->Enqueue(nullptr)) {
             std::cerr << "[Planner] ✗ Inference failed!" << std::endl;
             return;
@@ -397,10 +313,11 @@ private:
         auto infer_end = std::chrono::steady_clock::now();
         auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(infer_end - infer_start).count();
 
-        // Log planner inference latency periodically
+        // Periodic [Planner] summary line — only emitted when config_.log_summary
+        // is true. Sampled every 10 planner inferences (~1 Hz on the 10 Hz thread).
         planner_infer_count_++;
         planner_latency_sum_us_ += latency_us;
-        if (planner_infer_count_ % 10 == 1) {
+        if (config_.log_summary && planner_infer_count_ % 10 == 1) {
             bool has_nan = false, has_inf = false;
             float max_abs_val = 0.0f;
             for (size_t i = 0; i < mujoco_qpos_values_.size(); ++i) {
