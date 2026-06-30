@@ -136,10 +136,8 @@ class BaseConfig(ArgsConfigTemplate):
     control_frequency: int = 50
     """Frequency of the control loop."""
 
-    sim_frequency: int = 500
-    """Frequency of the simulation loop (physics step rate).
-    Set to 500 Hz to match the C++ command writer rate for accurate sim2sim.
-    Original: 200 Hz. MuJoCo timestep = 1/sim_frequency."""
+    sim_frequency: int = 200
+    """Frequency of the simulation loop."""
 
     # Robot Configuration
     enable_waist: bool = True

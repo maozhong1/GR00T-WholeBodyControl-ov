@@ -13,12 +13,12 @@
  * Four real-time threads are created by the Unitree SDK's
  * `CreateRecurrentThreadEx`:
  *
- *   Thread           | Rate                  | Method              | Responsibility
- *   -----------------|-----------------------|---------------------|-------------------------------
- *   Input            | 100 Hz                | G1Deploy::Input     | Poll input interface, handle commands.
- *   Control          | kControlFrequencyHz   | G1Deploy::Control   | Gather obs, run policy, compute motor targets.
- *   Planner          | 10 Hz                 | G1Deploy::Planner   | Re-plan locomotion trajectory.
- *   Command Writer   | 500 Hz                | G1Deploy::LowCommandWriter | Publish motor commands via DDS.
+ *   Thread           | Rate     | Method              | Responsibility
+ *   -----------------|----------|---------------------|-------------------------------
+ *   Input            | 100 Hz   | G1Deploy::Input     | Poll input interface, handle commands.
+ *   Control          | 50 Hz    | G1Deploy::Control   | Gather obs, run policy, compute motor targets.
+ *   Planner          | 10 Hz    | G1Deploy::Planner   | Re-plan locomotion trajectory.
+ *   Command Writer   | 500 Hz   | G1Deploy::LowCommandWriter | Publish motor commands via DDS.
  *
  * ## Control-Loop State Machine (ProgramState)
  *
@@ -423,36 +423,6 @@ class G1Deploy {
     // Independent logging counter (not affected by planner buffer cleaning)
     int logging_counter_ = 0;
 
-    // =========================================================================
-    // Control frequency configuration (for inference performance testing)
-    //
-    // The encoder/decoder models were trained at 50 Hz. To test inference
-    // throughput at higher rates, set kControlFrequencyHz to a multiple of 50
-    // (max 500). The reference motion still plays back at 50 Hz — consecutive
-    // inferences within the same 50 Hz window reuse the same reference frame.
-    //
-    // Examples:
-    //   50 Hz  → decimation 1  (original behavior, 1 inference per frame)
-    //  100 Hz  → decimation 2  (2 inferences per frame)
-    //  200 Hz  → decimation 4  (4 inferences per frame)
-    //  250 Hz  → decimation 5  (5 inferences per frame)
-    //  500 Hz  → decimation 10 (10 inferences per frame)
-    //
-    // NOTE: At >50 Hz, accuracy is NOT guaranteed (history-based observations
-    //       use a shorter physical time window). This mode is intended for
-    //       benchmarking encoder+decoder inference latency only.
-    // =========================================================================
-    static constexpr int kControlFrequencyHz = 50;  // <-- CHANGE THIS to 50/100/200/250/500
-    static constexpr int kMotionPlaybackHz = 50;     // Trained motion rate — do NOT change
-    static constexpr int kFrameAdvanceDecimation = kControlFrequencyHz / kMotionPlaybackHz;
-
-    static_assert(kControlFrequencyHz >= kMotionPlaybackHz,
-                  "Control frequency must be >= motion playback rate (50 Hz)");
-    static_assert(kControlFrequencyHz <= 500,
-                  "Control frequency must be <= command writer rate (500 Hz)");
-    static_assert(kControlFrequencyHz % kMotionPlaybackHz == 0,
-                  "Control frequency must be an integer multiple of 50 Hz");
-
     // Dump the per-motor MotorCmd_ subcommand fields (mode/q/dq/tau/kp/kd)
     // once every 10 seconds (0.1 Hz), taken from inside LowCommandWriter()
     // right before the DDS Write, i.e. exactly the bytes that go on the wire
@@ -463,7 +433,6 @@ class G1Deploy {
     static constexpr int kDecoderDumpDecimation = kPublishHz * kDecoderDumpPeriodSec;
     int decoder_dump_counter_ = 0;
 
-    int frame_advance_counter_ = 0;
     TimestampedData<LowState_> used_low_state_data_;
     TimestampedData<IMUState_> used_imu_torso_data_;
 
@@ -2306,7 +2275,7 @@ class G1Deploy {
       double initial_max_close_ratio = 1.0)
       : time_(0.0),
         publish_dt_(0.002),
-        control_dt_(1.0 / kControlFrequencyHz),
+        control_dt_(0.02),
         planner_dt_(0.1),
         input_dt_(0.01),
         duration_(3.0),
@@ -2578,8 +2547,6 @@ class G1Deploy {
       robot_config["obs_config_path"] = obs_config_path.empty() ? "none" : obs_config_path;
       robot_config["encoder_file"] = encoder_file_path.empty() ? "none" : encoder_file_path;
       robot_config["control_frequency"] = 1.0 / control_dt_;
-      robot_config["motion_playback_frequency"] = static_cast<double>(kMotionPlaybackHz);
-      robot_config["frame_advance_decimation"] = kFrameAdvanceDecimation;
       robot_config["planner_frequency"] = 1.0 / planner_dt_;
       robot_config["is_using_encoder"] = is_using_encoder_;
       robot_config["policy_fp16"] = policy_fp16;
@@ -2727,16 +2694,6 @@ class G1Deploy {
       }
 
       // create threads
-      std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << std::endl;
-      std::cout << "[Control] Frequency configuration:" << std::endl;
-      std::cout << "[Control]   Control loop:        " << kControlFrequencyHz << " Hz (dt=" << control_dt_ * 1000.0 << " ms)" << std::endl;
-      std::cout << "[Control]   Motion playback:     " << kMotionPlaybackHz << " Hz" << std::endl;
-      std::cout << "[Control]   Frame decimation:    " << kFrameAdvanceDecimation
-                << " (same reference for " << kFrameAdvanceDecimation << " consecutive inferences)" << std::endl;
-      std::cout << "[Control]   Command writer:      " << static_cast<int>(1.0 / publish_dt_) << " Hz" << std::endl;
-      std::cout << "[Control]   Planner:             " << static_cast<int>(1.0 / planner_dt_) << " Hz" << std::endl;
-      std::cout << "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" << std::endl;
-
       input_thread_ptr_ = CreateRecurrentThreadEx("Input", UT_CPU_ID_NONE, input_dt_ * 1e6, &G1Deploy::Input, this);
       command_writer_ptr_ = CreateRecurrentThreadEx("command_writer", UT_CPU_ID_NONE, publish_dt_ * 1e6,
                                                     &G1Deploy::LowCommandWriter, this);
@@ -3252,7 +3209,7 @@ class G1Deploy {
               token_state_data_.assign(token_state_data_.size(), 0.0);
               
               static int wait_count = 0;
-              if (wait_count % (kControlFrequencyHz * 5) == 0) {  // Print every ~5 seconds
+              if (wait_count % 250 == 0) {  // Print every ~5 seconds (50Hz * 250 = 5s)
                 std::cout << "⚠ [Token Safety] WARNING: No tokens received yet (" 
                           << elapsed.count() << "s elapsed). "
                           << "Robot will use zero tokens until tokens start streaming." << std::endl;
@@ -3495,15 +3452,8 @@ class G1Deploy {
           }
         }
           
-        // Frame advancement: advance reference frame every kFrameAdvanceDecimation ticks
-        // At 100 Hz control with decimation=2, reference motion still plays at 50 Hz
-        // (encoder+decoder run every tick with the same reference frame for 2 consecutive calls)
+        // Frame advancement at control frequency (50Hz) for smooth playback
         if (current_motion_->timesteps > 0 && operator_state.play) {
-          frame_advance_counter_++;
-          if (frame_advance_counter_ < kFrameAdvanceDecimation) {
-            return true;  // Skip frame advance — reuse same reference for next inference
-          }
-          frame_advance_counter_ = 0;
           int new_frame = current_frame_ + 1;
             if (new_frame >= current_motion_->timesteps) {
               new_frame = current_motion_->timesteps - 1; // Clamp to last frame
@@ -3577,14 +3527,6 @@ class G1Deploy {
       // Update motion frame playback for non-planner motion
       bool use_planner_motion = (current_motion_ && current_motion_ == planner_motion_);
       if (!use_planner_motion && current_motion_ && current_motion_->timesteps > 0 && operator_state.play) {
-        // Frame advance decimation: at 100 Hz control, only advance the reference
-        // frame every kFrameAdvanceDecimation ticks to maintain 50 Hz motion playback.
-        // Encoder+decoder still run every tick with the same reference data.
-        frame_advance_counter_++;
-        if (frame_advance_counter_ < kFrameAdvanceDecimation) {
-          return true;  // Skip frame advance — reuse same reference for next inference
-        }
-        frame_advance_counter_ = 0;
         // Update display motion current frame
         current_frame_++;
         // Check if motion completed (reached the end)
@@ -4302,7 +4244,7 @@ class G1Deploy {
             obs_to_motor_cmd_duration_stats_.push(static_cast<double>(motor_command_duration_tick.count()));
           }
 
-          if (logging_counter_ % kControlFrequencyHz == 0) {  // Log every ~1s
+          if (logging_counter_ % 50 == 0) {  // Log every ~1s
             auto control_loop_end_time = std::chrono::steady_clock::now();
             auto obs_duration = std::chrono::duration_cast<std::chrono::microseconds>(obs_end_time - obs_start_time);
             auto policy_duration = std::chrono::duration_cast<std::chrono::microseconds>(motor_command_end_time - obs_end_time);
