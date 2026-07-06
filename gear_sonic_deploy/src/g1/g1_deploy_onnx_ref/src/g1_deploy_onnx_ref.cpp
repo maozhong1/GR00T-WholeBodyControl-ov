@@ -46,22 +46,27 @@
  *   --policy-fp16         | Use FP16 for policy TensorRT engine
  */
 #include <cmath>
-#include <cuda_runtime_api.h>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <pthread.h>
 #include <sched.h>
+#include <signal.h>
+#include <atomic>
 #include <array>
 #include <vector>
 #include <algorithm>
 #include <chrono>
 #include <unistd.h>
 #include <cstring>
+#include <cstdlib>
+#include <cctype>
 #include <functional>
 #include <unordered_map>
 #include <fstream>
 #include <iostream>
+#include <iomanip>
+#include <sstream>
 #include <chrono>
 #include <algorithm>
 #include <numeric>
@@ -76,11 +81,13 @@
 #include <unitree/idl/hg/LowState_.hpp>
 #include <unitree/robot/b2/motion_switcher/motion_switcher_client.hpp>
 
-// TRTInference
-#include <TRTInference/InferenceEngine.h>
+// Inference backend (TensorRT or OpenVINO)
+#include "../include/inference_backend.hpp"
 
-// ONNX
+// ONNX Runtime (only needed for non-OpenVINO builds or if ORT is available)
+#if !defined(USE_OPENVINO) || defined(HAS_ONNXRUNTIME)
 #include <onnxruntime_cxx_api.h>
+#endif
 
 // Motion Data Reader
 #include "../include/motion_data_reader.hpp"
@@ -121,7 +128,6 @@
 
 #include "../include/output_interface/zmq_output_handler.hpp"
 
-#include <cuda_runtime.h>
 #include "../include/state_logger.hpp"
 
 // Encoder
@@ -287,6 +293,66 @@ class G1Deploy {
     static constexpr std::chrono::milliseconds STREAMING_DATA_ABSENT_THRESHOLD{150};
     CounterDebouncer streaming_data_absent_debouncer_{100, 500, 50, 1};
     RollingStats<1000> streaming_data_delay_rolling_stats_;
+    // Cumulative stats for inference timing (in microseconds).
+    // Stores every sample since the last reset() so P99 is exact. Reset is
+    // called on mode change (e.g. reference-motion → planner) and after planner
+    // init, so the sample buffer stays bounded in practice (one mode session).
+    // The first kWarmupTicks ticks of the whole run are ignored to skip the
+    // initial NPU model-compile spike; kPlannerWarmupTicks more are ignored
+    // after planner init for steady-state numbers.
+    static constexpr int kWarmupTicks = 100;  // Skip first 100 ticks for stats
+    static constexpr int kPlannerWarmupTicks = 10;  // Skip 10 ticks after planner init
+    int planner_warmup_remaining_ = 0;  // Countdown after planner init
+    struct CumulativeStats {
+      std::vector<double> samples_;
+      double min_ = std::numeric_limits<double>::max();
+      double max_ = 0.0;
+      double sum_ = 0.0;
+      bool sorted_ = false;
+      std::vector<double> sorted_cache_;
+
+      double mean() const {
+        return samples_.empty() ? 0.0 : sum_ / static_cast<double>(samples_.size());
+      }
+      double min() const { return samples_.empty() ? 0.0 : min_; }
+      double max() const { return max_; }
+
+      // Exact percentile (0.0–1.0) over all samples accumulated since last reset.
+      double percentile(double p) {
+        if (samples_.empty()) return 0.0;
+        if (!sorted_) {
+          sorted_cache_ = samples_;
+          std::sort(sorted_cache_.begin(), sorted_cache_.end());
+          sorted_ = true;
+        }
+        size_t idx = static_cast<size_t>(p * static_cast<double>(sorted_cache_.size() - 1));
+        return sorted_cache_[idx];
+      }
+
+      void push(double v) {
+        samples_.push_back(v);
+        sum_ += v;
+        if (v < min_) min_ = v;
+        if (v > max_) max_ = v;
+        sorted_ = false;
+      }
+
+      void reset() {
+        samples_.clear();
+        sorted_cache_.clear();
+        sorted_ = false;
+        min_ = std::numeric_limits<double>::max();
+        max_ = 0.0;
+        sum_ = 0.0;
+      }
+    };
+    CumulativeStats obs_duration_stats_;
+    CumulativeStats policy_duration_stats_;
+    CumulativeStats obs_to_motor_cmd_duration_stats_;
+    // Planner model inference latency stats. Pushed from the 10 Hz planner
+    // thread, read from the 50 Hz control thread for logging — guarded by mutex.
+    CumulativeStats planner_model_duration_stats_;
+    std::mutex planner_model_duration_stats_mutex_;
     std::unique_ptr<AudioThread> audio_thread_;
     
     // =========================================================================
@@ -330,6 +396,7 @@ class G1Deploy {
     
     // Independent logging counter (not affected by planner buffer cleaning)
     int logging_counter_ = 0;
+
     TimestampedData<LowState_> used_low_state_data_;
     TimestampedData<IMUState_> used_imu_torso_data_;
 
@@ -346,6 +413,8 @@ class G1Deploy {
     std::string model_path;
     std::unique_ptr<EncoderEngine> encoder_engine_;
     EncoderConfig encoder_config_;  // Encoder configuration from observation config
+    InferenceConfig inference_config_;  // Inference device and affinity configuration
+    bool control_thread_affinity_set_ = false;  // One-shot flag for control thread CPU pinning
     bool is_using_encoder_ = false;
     int initial_encoder_mode_ = -2;  // -2: no token state. -1: need token state but no encoder. 0,1,2,...: encoder mode.
     int last_logged_encoder_mode_ = -999;  // Track last logged mode to avoid spam
@@ -1642,8 +1711,13 @@ class G1Deploy {
 
     /// Populate the token_state observation (either from local encoder or external data).
     bool GatherTokenState(std::vector<double>& target_buffer, size_t offset) {
+      static int gather_token_log_counter_ = 0;
       if (!is_using_encoder_) {
         // No encoder configured; use token_state_data_ (can be set externally via ROS2/ZMQ)
+        if (gather_token_log_counter_++ % 250 == 0) {
+          std::cout << "[TokenState] Using EXTERNAL tokens (encoder NOT active), tokens[0]="
+                    << token_state_data_[0] << std::endl;
+        }
         std::copy(token_state_data_.begin(), token_state_data_.end(), target_buffer.begin() + offset);
         return true;
       }
@@ -1660,9 +1734,15 @@ class G1Deploy {
       }
 
       // Run encoder inference (handles CPU→GPU transfer, inference, GPU→CPU transfer)
+      auto encoder_start = std::chrono::steady_clock::now();
       if (!encoder_engine_->Encode()) {
         std::cerr << "✗ Error: Encoder inference failed" << std::endl;
         return false;
+      }
+      auto encoder_end = std::chrono::steady_clock::now();
+      if (gather_token_log_counter_++ % 250 == 0) {
+        auto encoder_us = std::chrono::duration_cast<std::chrono::microseconds>(encoder_end - encoder_start).count();
+        std::cout << "[TokenState] Using LOCAL ENCODER inference (" << encoder_us << " us)" << std::endl;
       }
 
       // Access encoded tokens from encoder's internal buffer (already populated by Encode)
@@ -2290,25 +2370,8 @@ class G1Deploy {
         throw std::runtime_error("Failed to load motion data");
       }
       
-      // Initialize control policy
-      policy_engine_ = std::make_unique<PolicyEngine>();
-      
-      if (!policy_engine_->Initialize(model_path, policy_fp16)) {
-        throw std::runtime_error("Failed to initialize control policy from: " + model_path);
-      }
-      
-      // Initialize observation buffer with correct size (zero-initialized)
-      size_t obs_dim = policy_engine_->GetInputDimension();
-      obs_buffer_.resize(obs_dim, 0.0);
-      
-      // Capture CUDA graph for optimized execution
-      if (!policy_engine_->CaptureGraph()) {
-        throw std::runtime_error("Failed to capture control policy CUDA graph");
-      }
-      
-      std::cout << "✓ Policy model loaded successfully!" << std::endl;
-
-      // Load observation configuration FIRST (before encoder/planner initialization)
+      // Load observation configuration FIRST (before model initialization)
+      // This provides device settings for policy/encoder/planner
       std::cout << "Loading observation configuration..." << std::endl;
       FullObservationConfig full_obs_config;
       if (!obs_config_path.empty()) {
@@ -2318,14 +2381,31 @@ class G1Deploy {
         std::cout << "Using default observation configuration" << std::endl;
         full_obs_config.observations = ObservationConfigParser::ParseConfig();
       }
-      
+
       // Check if config parsing failed (empty observations returned)
       if (full_obs_config.observations.empty()) {
         throw std::runtime_error("Failed to parse observation configuration - check config file for errors");
       }
-      
+
       obs_config_ = full_obs_config.observations;
       encoder_config_ = full_obs_config.encoder;
+      inference_config_ = full_obs_config.inference;
+      InferenceConfig& inference_config = inference_config_;
+
+      // Initialize control policy
+      policy_engine_ = std::make_unique<PolicyEngine>();
+
+      if (!policy_engine_->Initialize(model_path, policy_fp16, inference_config.policy_device,
+                                      inference_config.policy_npu_tiles,
+                                      inference_config.policy_priority)) {
+        throw std::runtime_error("Failed to initialize control policy from: " + model_path);
+      }
+
+      // Initialize observation buffer with correct size (zero-initialized)
+      size_t obs_dim = policy_engine_->GetInputDimension();
+      obs_buffer_.resize(obs_dim, 0.0);
+
+      std::cout << "✓ Policy model loaded successfully!" << std::endl;
       
       // Initialize token buffer size from encoder config
       if (encoder_config_.dimension > 0) {
@@ -2342,7 +2422,10 @@ class G1Deploy {
         std::cout << "Initializing encoder..." << std::endl;
         encoder_engine_ = std::make_unique<EncoderEngine>();
         
-        if (!encoder_engine_->Initialize(encoder_file_path, encoder_config_.use_fp16)) {
+        if (!encoder_engine_->Initialize(encoder_file_path, encoder_config_.use_fp16,
+                                         inference_config.encoder_device,
+                                         inference_config.encoder_npu_tiles,
+                                         inference_config.encoder_priority)) {
           throw std::runtime_error("Failed to initialize encoder engine from: " + encoder_file_path);
         }
         
@@ -2356,11 +2439,6 @@ class G1Deploy {
         size_t encoder_input_size = encoder_engine_->GetInputDimension();
         encoder_obs_buffer_.resize(encoder_input_size, 0.0);
 
-        // Capture CUDA graph for optimized execution
-        if (!encoder_engine_->CaptureGraph()) {
-          throw std::runtime_error("Failed to capture encoder CUDA graph");
-        }
-        
         std::cout << "✓ Encoder model loaded successfully!" << std::endl;
         is_using_encoder_ = true;
         initial_encoder_mode_ = 0;  // Encoder available, default to mode 0.
@@ -2410,6 +2488,10 @@ class G1Deploy {
           std::cout << "Unsupported planner version: " << planner_path << std::endl;
           throw std::runtime_error("Unsupported planner version: " + planner_path);
         }
+        planner_config.device = inference_config.planner_device;
+        planner_config.npu_tiles = inference_config.planner_npu_tiles;
+        planner_config.model_priority = inference_config.planner_priority;
+        planner_config.log_summary = inference_config.planner_log_summary;
         planner_ = std::make_unique<LocalMotionPlannerTensorRT>(planner_fp16, 0, planner_config);
       }
       
@@ -2597,10 +2679,9 @@ class G1Deploy {
       struct sched_param param;
       param.sched_priority = sched_get_priority_max(SCHED_FIFO);
       pthread_setschedparam(pthread_self(), SCHED_FIFO, &param);
-      cpu_set_t cpuset;
-      CPU_ZERO(&cpuset);
-      CPU_SET(0, &cpuset);
-      pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+      // Note: CPU affinity for the control thread (encoder + decoder) is set
+      // inside Control() using inference_config_.cpu_affinity. This only sets
+      // the main thread's scheduling priority.
     }
 
     /// DDS callback: receives a 500 Hz LowState message from the robot SDK.
@@ -3099,10 +3180,11 @@ class G1Deploy {
      * (hardware order) using `g1_action_scale` and `default_angles`.
      */
     bool CreatePolicyCommand() {
-      // Convert double observation to float and populate policy's internal input buffer
-      auto& obs_buffer_float = policy_engine_->GetInputBuffer();
-      for (size_t i = 0; i < obs_buffer_.size(); i++) { 
-        obs_buffer_float[i] = static_cast<float>(obs_buffer_[i]); 
+      // Convert double observation to float — writes directly into OV tensor
+      // when zero-copy is available (no intermediate buffer copy)
+      float* input_ptr = policy_engine_->GetInputBufferPtr();
+      for (size_t i = 0; i < obs_buffer_.size(); i++) {
+        input_ptr[i] = static_cast<float>(obs_buffer_[i]);
       }
 
       // Run policy inference (handles CPU→GPU transfer, inference, GPU→CPU transfer)
@@ -3291,6 +3373,20 @@ class G1Deploy {
             idle_readapt_stored_ = false;
             if(is_the_first_time) {
               reinitialize_heading_ = true;
+
+              // Reference-motion → planner mode switch: reset inference stats
+              // so percentile/avg reflect planner-mode steady state, and skip
+              // the next kPlannerWarmupTicks ticks to ignore the transient.
+              obs_duration_stats_.reset();
+              policy_duration_stats_.reset();
+              obs_to_motor_cmd_duration_stats_.reset();
+              {
+                std::lock_guard<std::mutex> lock(planner_model_duration_stats_mutex_);
+                planner_model_duration_stats_.reset();
+              }
+              planner_warmup_remaining_ = kPlannerWarmupTicks;
+              std::cout << "[Stats] Reset inference timing stats on planner-mode entry (skipping "
+                        << kPlannerWarmupTicks << " warmup ticks)" << std::endl;
             }
           }
         }
@@ -3580,6 +3676,21 @@ class G1Deploy {
               }
 
               std::cout << "Planner initialized successfully!" << std::endl;
+
+              // Reset inference timing stats after planner init to exclude the
+              // one-time initialization spike from steady-state measurements.
+              // Also skip the next kPlannerWarmupTicks ticks to let the system
+              // settle (NPU pipeline fill, thread scheduling stabilization).
+              obs_duration_stats_.reset();
+              policy_duration_stats_.reset();
+              obs_to_motor_cmd_duration_stats_.reset();
+              {
+                std::lock_guard<std::mutex> lock(planner_model_duration_stats_mutex_);
+                planner_model_duration_stats_.reset();
+              }
+              planner_warmup_remaining_ = kPlannerWarmupTicks;
+              std::cout << "[Stats] Reset inference timing stats after planner init (skipping "
+                        << kPlannerWarmupTicks << " warmup ticks)" << std::endl;
               
               // Start recording session for planner motion (if enabled)
               if (enable_motion_recording_) {
@@ -3740,7 +3851,16 @@ class G1Deploy {
               )) {
                 throw std::runtime_error("Error when updating planner");
               }
-              
+
+              // Accumulate planner model inference latency (skip during warmup
+              // window so the one-time NPU compile/load spike doesn't skew max).
+              if (planner_warmup_remaining_ <= 0) {
+                std::lock_guard<std::mutex> lock(planner_model_duration_stats_mutex_);
+                planner_model_duration_stats_.push(
+                    static_cast<double>(planner_->last_timing_.model_duration.count()));
+              }
+
+
             } catch (const std::exception& e) {
               std::cout << "✗ Error during planning update: " << e.what() << std::endl;
               std::cout << "Disabling planner to prevent further errors..." << std::endl;
@@ -3796,6 +3916,21 @@ class G1Deploy {
      */
     void Control() {
       if (operator_state.stop) { return; }
+
+      // Pin this thread to a specific CPU core (once) for deterministic
+      // encoder + decoder inference latency. Planner runs in a separate thread.
+      if (!control_thread_affinity_set_ && inference_config_.cpu_affinity >= 0) {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(inference_config_.cpu_affinity, &cpuset);
+        if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) == 0) {
+          std::cout << "[Control] ✓ Thread pinned to CPU core " << inference_config_.cpu_affinity
+                    << " (encoder + decoder inference)" << std::endl;
+        } else {
+          std::cerr << "[Control] ⚠ Failed to pin thread to core " << inference_config_.cpu_affinity << std::endl;
+        }
+        control_thread_affinity_set_ = true;
+      }
 
       switch (program_state_) {
         case ProgramState::INIT:
@@ -4036,26 +4171,59 @@ class G1Deploy {
             return;
           }
 
-          if (logging_counter_ % 50 == 0) {
+          // Accumulate inference timing stats every tick (skip warm-up phases)
+          if (planner_warmup_remaining_ > 0) {
+            planner_warmup_remaining_--;
+          } else if (logging_counter_ > kWarmupTicks) {
+            auto obs_duration_tick = std::chrono::duration_cast<std::chrono::microseconds>(obs_end_time - obs_start_time);
+            auto policy_duration_tick = std::chrono::duration_cast<std::chrono::microseconds>(motor_command_end_time - obs_end_time);
+            auto motor_command_duration_tick = std::chrono::duration_cast<std::chrono::microseconds>(motor_command_end_time - obs_start_time);
+            obs_duration_stats_.push(static_cast<double>(obs_duration_tick.count()));
+            policy_duration_stats_.push(static_cast<double>(policy_duration_tick.count()));
+            obs_to_motor_cmd_duration_stats_.push(static_cast<double>(motor_command_duration_tick.count()));
+          }
+
+          if (logging_counter_ % 50 == 0) {  // Log every ~1s
             auto control_loop_end_time = std::chrono::steady_clock::now();
             auto obs_duration = std::chrono::duration_cast<std::chrono::microseconds>(obs_end_time - obs_start_time);
             auto policy_duration = std::chrono::duration_cast<std::chrono::microseconds>(motor_command_end_time - obs_end_time);
             auto motor_command_duration = std::chrono::duration_cast<std::chrono::microseconds>(motor_command_end_time - obs_start_time);
             auto post_hand_joint_duration = std::chrono::duration_cast<std::chrono::microseconds>(control_loop_end_time - hand_joint_end_time);
-            
+
             std::cout << "Loop timing - LowState age: " << used_low_state_data_.GetAgeMs() << "ms"
                       << ", Streaming data mean delay: " << streaming_data_delay_rolling_stats_.mean() << "ms"
                       << ", Streaming data std delay: " << streaming_data_delay_rolling_stats_.stddev() << "ms"
                       << ", IMU age: " << used_imu_torso_data_.GetAgeMs() << "ms"
-                      << ", Obs: " << obs_duration.count() << "us"
-                      << ", Policy: " << policy_duration.count() << "us"
-                      << ", Obs 2 Motor Command: " << motor_command_duration.count() << "us"
+                      << ", Obs: " << obs_duration.count() << "us (avg:" << static_cast<int>(obs_duration_stats_.mean())
+                        << " min:" << static_cast<int>(obs_duration_stats_.min())
+                        << " P99:" << static_cast<int>(obs_duration_stats_.percentile(0.99))
+                        << " max:" << static_cast<int>(obs_duration_stats_.max()) << ")"
+                      << ", Policy: " << policy_duration.count() << "us (avg:" << static_cast<int>(policy_duration_stats_.mean())
+                        << " min:" << static_cast<int>(policy_duration_stats_.min())
+                        << " P99:" << static_cast<int>(policy_duration_stats_.percentile(0.99))
+                        << " max:" << static_cast<int>(policy_duration_stats_.max()) << ")"
+                      << ", Obs 2 Motor Command: " << motor_command_duration.count() << "us (avg:" << static_cast<int>(obs_to_motor_cmd_duration_stats_.mean())
+                        << " min:" << static_cast<int>(obs_to_motor_cmd_duration_stats_.min())
+                        << " P99:" << static_cast<int>(obs_to_motor_cmd_duration_stats_.percentile(0.99))
+                        << " max:" << static_cast<int>(obs_to_motor_cmd_duration_stats_.max()) << ")"
                       << ", Post processing: " << post_hand_joint_duration.count() << "us";
             
             // Add planner timing if planner is enabled and initialized
             if (planner_ && planner_->planner_state_.enabled && planner_->planner_state_.initialized) {
+              int planner_model_avg = 0, planner_model_min = 0, planner_model_p99 = 0, planner_model_max = 0;
+              {
+                std::lock_guard<std::mutex> lock(planner_model_duration_stats_mutex_);
+                planner_model_avg = static_cast<int>(planner_model_duration_stats_.mean());
+                planner_model_min = static_cast<int>(planner_model_duration_stats_.min());
+                planner_model_p99 = static_cast<int>(planner_model_duration_stats_.percentile(0.99));
+                planner_model_max = static_cast<int>(planner_model_duration_stats_.max());
+              }
               std::cout << ", Planner - Gather Input: " << planner_->last_timing_.gather_input_duration.count() << "us"
                         << ", Model: " << planner_->last_timing_.model_duration.count() << "us"
+                        << " (avg:" << planner_model_avg
+                        << " min:" << planner_model_min
+                        << " P99:" << planner_model_p99
+                        << " max:" << planner_model_max << ")"
                         << ", Convert50Hz: " << planner_->last_timing_.extract_duration.count() << "us"
                         << ", Total: " << planner_->last_timing_.total_duration.count() << "us";
             }
@@ -4090,7 +4258,20 @@ class G1Deploy {
  * All other arguments are optional flags (see --help for full list).
  * The main loop sleeps until the operator issues a stop signal or ROS2 shuts down.
  */
+
+// Global flag for signal handler → main loop communication
+static std::atomic<bool> g_signal_received{false};
+
+static void SignalHandler(int signum) {
+  std::cout << "\n[INFO] Signal " << signum << " received, shutting down gracefully..." << std::endl;
+  g_signal_received.store(true);
+}
+
 int main(int argc, char const* argv[]) {
+  // Install signal handlers for graceful shutdown
+  signal(SIGINT, SignalHandler);
+  signal(SIGTERM, SignalHandler);
+
   std::cout << "[DEBUG] Program starting..." << std::endl;
   if (argc < 4) {
     std::cout << "Usage: " << argv[0] << " <network_interface> <policy_file> <motion_data_path> [OPTIONS]"
@@ -4442,20 +4623,20 @@ int main(int argc, char const* argv[]) {
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   
-  // Main application loop - check both operator_state.stop and ROS2 status if using ROS2
+  // Main application loop - check stop flag and signal
 #if HAS_ROS2
   if (inputType == "ros2") {
-    while (!custom.operator_state.stop && rclcpp::ok()) { 
-      sleep(0.02); 
+    while (!custom.operator_state.stop && !g_signal_received.load() && rclcpp::ok()) {
+      usleep(20000);
     }
     if (!rclcpp::ok()) {
       std::cout << "[INFO] ROS2 shutdown detected (Ctrl+C)" << std::endl;
     }
   } else {
-    while (!custom.operator_state.stop) { sleep(0.02); }
+    while (!custom.operator_state.stop && !g_signal_received.load()) { usleep(20000); }
   }
 #else
-  while (!custom.operator_state.stop) { sleep(0.02); }
+  while (!custom.operator_state.stop && !g_signal_received.load()) { usleep(20000); }
 #endif
   
   std::cout << "[DEBUG] Stopping G1Deploy..." << std::endl;

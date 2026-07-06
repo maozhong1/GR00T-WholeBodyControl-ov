@@ -78,3 +78,30 @@ encoder:
         - smpl_joints_10frame_step1
         - smpl_anchor_orientation_10frame_step1
         - motion_joint_positions_wrists_10frame_step1
+
+inference:
+  encoder_device: "NPU"
+  policy_device: "NPU"
+  planner_device: "NPU"
+  # NPU tile allocation per model (0=auto/driver default, 1-N=specific tile count).
+  # Encoder+decoder run sequentially in the control thread — 1 tile each is sufficient.
+  # Planner runs in a separate thread — can use more tiles for throughput.
+  encoder_npu_tiles: 3
+  policy_npu_tiles: 3
+  planner_npu_tiles: 3
+  # OpenVINO model priority: HIGH, NORMAL, or LOW. Controls how the OV scheduler
+  # arbitrates models that share the same device (e.g. policy/encoder/planner on
+  # one NPU). Mapped to ov::hint::model_priority. Default: NORMAL.
+  encoder_priority: "HIGH"
+  policy_priority: "HIGH"
+  planner_priority: "NORMAL"
+  # Pin the inference/control thread to a specific CPU core to reduce latency jitter.
+  # Set to -1 to disable pinning (default), or a core number (e.g., 10) to pin.
+  # Here 10 is one of isolated core, dedicated for inference.
+  # use 'echo 10 | sudo tee /proc/irq/189/smp_affinity_list' to set vpu interrupt affitiy
+  # to reduce jitter in case NPU sync inference.
+  cpu_affinity: 10
+  # Emit a periodic "[Planner] Inference #N | latency | NaN/Inf check | mode/vel/dir"
+  # summary line (every 10th planner inference, ~1 Hz on the 10 Hz planner thread).
+  # Off by default — turn on for accuracy/sanity checking, leave off in production.
+  planner_log_summary: false

@@ -1,21 +1,15 @@
 /**
  * @file localmotion_kplanner_tensorrt.hpp
- * @brief TensorRT (GPU) backend for the locomotion planner.
+ * @brief OpenVINO (CPU) backend for the locomotion planner.
  *
  * LocalMotionPlannerTensorRT is a concrete implementation of
- * LocalMotionPlannerBase that runs planner inference on the GPU via NVIDIA
- * TensorRT.  It is the production backend, offering significantly lower
- * latency than the ONNX Runtime backend.
+ * LocalMotionPlannerBase that runs planner inference on the CPU via OpenVINO.
  *
- * ## GPU Pipeline
+ * ## Pipeline
  *
- *   1. Constructor converts the ONNX model to a TensorRT engine (cached on
- *      disk), creates a CUDA stream, and captures a CUDA graph for the
- *      inference pass.
- *   2. `UpdateInputTensors()` writes new locomotion commands into pinned-
- *      memory (`TPinnedVector`) buffers on the host.
- *   3. `RunInference()` asynchronously copies inputs to the GPU, launches
- *      the captured CUDA graph, copies outputs back, and synchronises.
+ *   1. Constructor loads the ONNX model via OpenVINO and runs a warmup.
+ *   2. `UpdateInputTensors()` writes new locomotion commands into buffers.
+ *   3. `RunInference()` sets inputs, runs Enqueue(), reads outputs.
  *   4. Output buffers (`mujoco_qpos_values_`, `num_pred_frames_values_`)
  *      are read by the base class to resample the trajectory at 50 Hz.
  *
@@ -25,53 +19,38 @@
  *   --------|--------|------
  *   0       | 6      | Basic: context, mode, target_vel, movement/facing direction, random_seed.
  *   1–2     | 11     | Adds: height, has_specific_target, specific_target_positions/headings, allowed_pred_num_tokens.
- *
- * ## CUDA Graph
- *
- * A CUDA graph is captured during `InitializeEngine()` and replayed on every
- * `RunInference()` call.  This eliminates kernel launch overhead and ensures
- * deterministic timing (~1–2 ms per planning cycle on Jetson Orin).
  */
 
 #ifndef LOCALMOTION_KPLANNER_TENSORRT_HPP
 #define LOCALMOTION_KPLANNER_TENSORRT_HPP
 
-#include <TRTInference/InferenceEngine.h>
+#include "inference_backend.hpp"
 #include <iostream>
+#include <chrono>
+#include <cmath>
 #include "localmotion_kplanner.hpp"
-#include <cuda_runtime.h>
 
 /**
  * @class LocalMotionPlannerTensorRT
- * @brief TensorRT (GPU) backend for the locomotion planner.
- *
- * Uses CUDA graphs and pinned memory for low-latency, deterministic inference.
+ * @brief OpenVINO (CPU) backend for the locomotion planner.
  */
 class LocalMotionPlannerTensorRT : public LocalMotionPlannerBase {
 public:
     /**
      * @brief Constructor for LocalMotionPlannerTensorRT
      * @param use_fp16 Whether to use FP16 precision
-     * @param device_id CUDA device ID to use for inference
+     * @param device_id Unused (kept for API compatibility)
      * @param config Planner configuration parameters
      */
     LocalMotionPlannerTensorRT(bool use_fp16,
                                int device_id = 0,
                                const PlannerConfig& config = PlannerConfig())
         : LocalMotionPlannerBase(config), use_fp16_(use_fp16),
-          device_id_(device_id), cuda_stream_(nullptr), graph_(nullptr), graphExec_(nullptr) {
-        
-        // Initialize TensorRT engine
+          device_id_(device_id) {
+
         inference_engine_ = std::make_unique<TRTInferenceEngine>();
 
-        // Clear all input value vectors and ensure correct sizes:
-        mode_values_.clear();
-        target_vel_values_.clear();
-        movement_direction_values_.clear();
-        facing_direction_values_.clear();
-        random_seed_values_.clear();
-        context_qpos_values_.clear();
-
+        // Initialize input buffers
         mode_values_.resize(1);
         target_vel_values_.resize(1);
         movement_direction_values_.resize(3, 0.0f);
@@ -79,203 +58,158 @@ public:
         random_seed_values_.resize(1);
         context_qpos_values_.resize(4 * (G1_NUM_MOTOR + 7));
 
-        {
-            // version 1
-            target_height_values_.clear();
-            has_specific_target_.clear(); 
-            specific_target_positions_.clear(); 
-            specific_target_headings_.clear(); 
-            allowed_pred_num_tokens_.clear(); 
+        // Version 1+ inputs
+        target_height_values_.resize(1, -1.0f);
+        has_specific_target_.resize(1, 0);
+        specific_target_positions_.resize(12, 0.0f);
+        specific_target_headings_.resize(4, 0.0f);
+        allowed_pred_num_tokens_.resize(11, 0);
 
-            target_height_values_.resize(1,-1.0f); 
-            has_specific_target_.resize(1,0); 
-            specific_target_positions_.resize(12,0.0f); 
-            specific_target_headings_.resize(4,0.0f); 
-            allowed_pred_num_tokens_.resize(11,0);
+        // Default allowed tokens
+        allowed_pred_num_tokens_[0] = 0; // 6 tokens
+        allowed_pred_num_tokens_[1] = 0; // 7
+        allowed_pred_num_tokens_[2] = 0; // 8
+        allowed_pred_num_tokens_[3] = 1; // 9
+        allowed_pred_num_tokens_[4] = 1; // 10
+        allowed_pred_num_tokens_[5] = 1;
 
-            // set allowed_pred_num_tokens_ to [1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0]
-            allowed_pred_num_tokens_[0] = 0; // 6 tokens
-            allowed_pred_num_tokens_[1] = 0; // 7
-            allowed_pred_num_tokens_[2] = 0; // 8
-            allowed_pred_num_tokens_[3] = 1; // 9
-            allowed_pred_num_tokens_[4] = 1; // 10
-            allowed_pred_num_tokens_[5] = 1;
-        }
-
-
-        // Clear output buffers
-        mujoco_qpos_values_.clear();
-        num_pred_frames_values_.clear();
-        
-        // Initialize output vectors with defaults
+        // Initialize output buffers
         mujoco_qpos_values_.resize(64 * 36);
         num_pred_frames_values_.resize(1);
 
         bool success = InitializeEngine();
         if (!success) {
-            std::cout << "✗ Failed to initialize TensorRT engine" << std::endl;
-            throw std::runtime_error("Failed to initialize TensorRT engine");
+            std::cout << "✗ Failed to initialize planner engine" << std::endl;
+            throw std::runtime_error("Failed to initialize planner engine");
         }
-        
-        // CUDA stream will be created in the .cpp implementation
-        // to avoid including full CUDA headers in the header file
     }
 
-    /**
-     * @brief Destructor
-     */
-    ~LocalMotionPlannerTensorRT() {
-        if (graphExec_) {
-            cudaGraphExecDestroy(graphExec_);
-        }
-        if (graph_) {
-            cudaGraphDestroy(graph_);
-        }
-        if (cuda_stream_) {
-            cudaStreamDestroy(cuda_stream_);
-        }
-    }
+    ~LocalMotionPlannerTensorRT() = default;
 
     bool InitializeSpecific() override {
-        if (!inference_engine_) {
-            return false;
-        }
-        
-
-        return true;
+        return inference_engine_ != nullptr;
     }
-
-
-    // TensorRT always uses CUDA streams for async inference (like existing code)
-
-    /**
-     * @brief Get current CUDA stream (for async operations)
-     * @return Current CUDA stream
-     */
-    cudaStream_t GetCudaStream() const { return cuda_stream_; }
 
 private:
     // ------------------------------------------------------------------
-    // TensorRT engine components
+    // Engine components
     // ------------------------------------------------------------------
-    std::unique_ptr<TRTInferenceEngine> inference_engine_;  ///< TensorRT inference engine.
-    bool use_fp16_;           ///< FP16 precision flag.
-    int device_id_;           ///< CUDA device ID.
-    cudaStream_t cuda_stream_;  ///< CUDA stream for async operations.
-    cudaGraph_t graph_;         ///< Captured CUDA graph (inference pass).
-    cudaGraphExec_t graphExec_; ///< Instantiated CUDA graph for replay.
+    std::unique_ptr<TRTInferenceEngine> inference_engine_;
+    bool use_fp16_;
+    int device_id_;
 
     // ------------------------------------------------------------------
-    // Input data buffers (pinned memory for efficient CPU ↔ GPU transfers)
+    // Input data buffers
     // ------------------------------------------------------------------
-    TPinnedVector<float> context_qpos_values_;          ///< [4 × 36] Context frames (7 root + 29 joints each).
-    TPinnedVector<int64_t> mode_values_;                ///< [1] Locomotion mode.
-    TPinnedVector<float> target_vel_values_;            ///< [1] Target speed (−1 = default).
-    TPinnedVector<float> movement_direction_values_;    ///< [3] Movement direction unit vector.
-    TPinnedVector<float> facing_direction_values_;      ///< [3] Facing direction unit vector.
-    TPinnedVector<int64_t> random_seed_values_;         ///< [1] Random seed.
+    std::vector<float> context_qpos_values_;          ///< [4 × 36] Context frames.
+    std::vector<int64_t> mode_values_;                ///< [1] Locomotion mode.
+    std::vector<float> target_vel_values_;            ///< [1] Target speed.
+    std::vector<float> movement_direction_values_;    ///< [3] Movement direction.
+    std::vector<float> facing_direction_values_;      ///< [3] Facing direction.
+    std::vector<int64_t> random_seed_values_;         ///< [1] Random seed.
 
     // Version 1–2 additional inputs
-    TPinnedVector<float> target_height_values_;         ///< [1] Target body height (−1 = default).
-    TPinnedVector<int64_t> has_specific_target_;        ///< [1] Whether specific waypoint target is set.
-    TPinnedVector<float> specific_target_positions_;    ///< [12] 4 waypoint positions × xyz.
-    TPinnedVector<float> specific_target_headings_;     ///< [4]  4 waypoint heading angles.
-    TPinnedVector<int64_t> allowed_pred_num_tokens_;    ///< [11] Allowed prediction token mask.
+    std::vector<float> target_height_values_;         ///< [1] Target body height.
+    std::vector<int64_t> has_specific_target_;        ///< [1] Waypoint target flag.
+    std::vector<float> specific_target_positions_;    ///< [12] 4 waypoint positions × xyz.
+    std::vector<float> specific_target_headings_;     ///< [4] 4 waypoint heading angles.
+    std::vector<int64_t> allowed_pred_num_tokens_;    ///< [11] Prediction token mask.
 
     // ------------------------------------------------------------------
-    // Output data buffers (pinned memory)
+    // Output data buffers
     // ------------------------------------------------------------------
-    TPinnedVector<float> mujoco_qpos_values_;           ///< [frames × 36] Predicted qpos (7 root + 29 joints).
-    TPinnedVector<int32_t> num_pred_frames_values_;     ///< [1] Number of predicted 30 Hz frames.
+    std::vector<float> mujoco_qpos_values_;           ///< [frames × 36] Predicted qpos.
+    std::vector<int32_t> num_pred_frames_values_;     ///< [1] Number of predicted frames.
 
-    /// Named tensor identifiers used for TensorRT SetInput/GetOutput calls.
+    // ------------------------------------------------------------------
+    // Inference logging
+    // ------------------------------------------------------------------
+    uint64_t planner_infer_count_ = 0;
+    uint64_t planner_latency_sum_us_ = 0;
+
+    /// Named tensor identifiers.
     struct TensorNames {
         std::string context_qpos = "context_mujoco_qpos";
         std::string mode = "mode";
         std::string target_vel = "target_vel";
-        std::string target_height = "height"; // version 1
-        std::string has_specific_target = "has_specific_target"; // version 1
-        std::string specific_target_positions = "specific_target_positions"; // version 1
-        std::string specific_target_headings = "specific_target_headings"; // version 1
-        std::string allowed_pred_num_tokens = "allowed_pred_num_tokens"; // version 1
-
+        std::string target_height = "height";
+        std::string has_specific_target = "has_specific_target";
+        std::string specific_target_positions = "specific_target_positions";
+        std::string specific_target_headings = "specific_target_headings";
+        std::string allowed_pred_num_tokens = "allowed_pred_num_tokens";
         std::string movement_direction = "movement_direction";
         std::string facing_direction = "facing_direction";
         std::string random_seed = "random_seed";
-        
         std::string mujoco_qpos_output = "mujoco_qpos";
         std::string num_pred_frames_output = "num_pred_frames";
     } tensor_names_;
 
     /**
-     * @brief Convert the ONNX model to TensorRT, initialise the engine, and capture a CUDA graph.
-     * @return True on success; false if conversion, initialisation, or validation fails.
+     * @brief Load and compile the ONNX model with OpenVINO, run warmup.
      */
     bool InitializeEngine() {
         std::cout << "Initialize Engine..." << std::endl;
 
-        // Create CUDA stream for async operations
-        cudaError_t status = cudaStreamCreate(&cuda_stream_);
-        if (status != cudaSuccess) {
-            std::cout << "✗ CUDA error: " << cudaGetErrorString(status) << std::endl;
-            return false;
-        }
-
-        // Setup options for ONNX to TensorRT conversion
         Options options;
         options.deviceID = device_id_;
         std::string prefix("planner_");
-        if(use_fp16_)
-        {
+        if (use_fp16_) {
             options.precision = Precision::FP16;
             prefix += "fp16_";
         }
-        
-        std::string cachedTRTFile;
+
+        std::string model_file;
         std::string onnxModelPath = config_.model_path;
-        
-        // Convert ONNX to TensorRT if needed
-        if (!ConvertONNXToTRT(options, onnxModelPath, cachedTRTFile, prefix, false)) {
-            std::cout << "✗ Failed to convert ONNX at " << onnxModelPath << std::endl;
+
+        if (!ConvertONNXToTRT(options, onnxModelPath, model_file, prefix, false)) {
+            std::cout << "✗ Failed to prepare planner model: " << onnxModelPath << std::endl;
             return false;
         }
-        
-        // Initialize the TensorRT inference engine
-        if (!inference_engine_->Initialize(cachedTRTFile, options.deviceID, options.dynamic_axes_names)) {
-            std::cout << "✗ Failed to initialize TensorRT model: " << cachedTRTFile << std::endl;
+
+        // Device-aware precision:
+        //   GPU/NPU → FP16 (native, handled by OVInferenceEngine)
+        //   CPU → FP32 (AVX/AVX-512 accelerated)
+        Precision planner_precision = use_fp16_ ? Precision::FP16 : Precision::FP32;
+        std::string precision_str = (config_.device == "GPU" || config_.device == "NPU" || use_fp16_) ? "FP16" : "FP32";
+        std::cout << "[Planner] Initializing with OpenVINO backend (" << config_.device << ", " << precision_str << ")..." << std::endl;
+        std::cout << "[Planner] Model: " << model_file << std::endl;
+
+        auto init_start = std::chrono::steady_clock::now();
+        if (!inference_engine_->Initialize(model_file, config_.device, planner_precision,
+                                           config_.npu_tiles, config_.model_priority)) {
+            std::cout << "✗ Failed to initialize planner on " << config_.device << ": " << model_file << std::endl;
             return false;
         }
-        
-        // Initialize engine inputs
+        auto init_end = std::chrono::steady_clock::now();
+        auto init_ms = std::chrono::duration_cast<std::chrono::milliseconds>(init_end - init_start).count();
+        std::cout << "[Planner] ✓ OpenVINO initialization took " << init_ms << "ms" << std::endl;
+
         if (!inference_engine_->InitInputs({})) {
-            std::cout << "✗ Failed to initialize TensorRT model inputs: " << cachedTRTFile << std::endl;
+            std::cout << "✗ Failed to initialize planner model inputs: " << model_file << std::endl;
             return false;
         }
-        
-        std::cout << "✓ Successfully converted ONNX to TRT: " << cachedTRTFile << std::endl;
 
-        // Capture a CUDA graph
-        cudaStreamBeginCapture(cuda_stream_, cudaStreamCaptureModeRelaxed);
-        if(!inference_engine_->Enqueue(cuda_stream_))
-        {
-            std::cout << "✗ Failed to enqueue inference for capturing cuda graph" << std::endl;
-            return false;
+        std::cout << "✓ Successfully loaded planner model: " << model_file << std::endl;
+
+        // Run warmup inference
+        std::cout << "[Planner] Running warmup inference..." << std::endl;
+        auto warmup_start = std::chrono::steady_clock::now();
+        if (!inference_engine_->Enqueue(nullptr)) {
+            std::cout << "[Planner] ⚠ Warmup inference failed (non-fatal)" << std::endl;
         }
-        cudaStreamEndCapture(cuda_stream_, &graph_);
-        cudaStreamSynchronize(cuda_stream_);
-        
-        cudaGraphInstantiate(&graphExec_, graph_, NULL, NULL, 0);
+        auto warmup_end = std::chrono::steady_clock::now();
+        auto warmup_ms = std::chrono::duration_cast<std::chrono::milliseconds>(warmup_end - warmup_start).count();
+        std::cout << "[Planner] ✓ Warmup inference took " << warmup_ms << "ms" << std::endl;
 
-        // Log tensor information for debugging
+        // Validate tensor names
         std::vector<std::string> inputNames = inference_engine_->GetInputTensorNames();
         std::vector<std::string> outputNames = inference_engine_->GetOutputTensorNames();
 
-        // Version-based input validation (ensure expected count and required names)
         size_t expectedInputs = (config_.version == 1 || config_.version == 2) ? 11 : 6;
         if (inputNames.size() != expectedInputs) {
             std::cout << "Model version: " << config_.version << std::endl;
             std::cout << "Model has " << inputNames.size() << " inputs, expected " << expectedInputs << std::endl;
-            std::cout << "✗ Failed to initialize TensorRT engine (input count mismatch)" << std::endl;
+            std::cout << "✗ Failed to initialize planner engine (input count mismatch)" << std::endl;
             return false;
         }
 
@@ -302,7 +236,7 @@ private:
                 }
             }
         }
-        
+
         std::cout << "Input tensors:" << std::endl;
         for (const auto& name : inputNames) {
             std::vector<int64_t> shape;
@@ -311,7 +245,7 @@ private:
             for (auto& dim : shape) {
                 std::cout << dim << " ";
             }
-            
+
             auto dataType = inference_engine_->GetTensorDataType(name);
             if (dataType == DataType::FLOAT) {
                 std::cout << "float";
@@ -324,7 +258,7 @@ private:
             }
             std::cout << std::endl;
         }
-        
+
         std::cout << "Output tensors:" << std::endl;
         for (const auto& name : outputNames) {
             std::vector<int64_t> shape;
@@ -333,7 +267,7 @@ private:
             for (auto& dim : shape) {
                 std::cout << dim << " ";
             }
-            
+
             auto dataType = inference_engine_->GetTensorDataType(name);
             if (dataType == DataType::FLOAT) {
                 std::cout << "float";
@@ -345,35 +279,73 @@ private:
             std::cout << std::endl;
         }
 
-        std::cout << "✓ TensorRT planner model loaded successfully!" << std::endl;
+        std::cout << "✓ Planner model loaded successfully!" << std::endl;
         return true;
     }
-    
-    /// Async GPU inference: copy inputs → launch CUDA graph → copy outputs → synchronise.
+
+    /// Run planner inference: set inputs → infer → read outputs.
     void RunInference() override {
-        inference_engine_->SetInputDataAsync(tensor_names_.context_qpos, context_qpos_values_, cuda_stream_);
-        inference_engine_->SetInputDataAsync(tensor_names_.facing_direction, facing_direction_values_, cuda_stream_);
-        inference_engine_->SetInputDataAsync(tensor_names_.mode, mode_values_, cuda_stream_);
-        inference_engine_->SetInputDataAsync(tensor_names_.target_vel, target_vel_values_, cuda_stream_);
-        inference_engine_->SetInputDataAsync(tensor_names_.movement_direction, movement_direction_values_, cuda_stream_);
-        inference_engine_->SetInputDataAsync(tensor_names_.random_seed, random_seed_values_, cuda_stream_);
-        
-        if (config_.version == 1 || config_.version == 2)
-        {
-            inference_engine_->SetInputDataAsync(tensor_names_.target_height, target_height_values_, cuda_stream_);
-            inference_engine_->SetInputDataAsync(tensor_names_.has_specific_target, has_specific_target_, cuda_stream_);
-            inference_engine_->SetInputDataAsync(tensor_names_.specific_target_positions, specific_target_positions_, cuda_stream_);
-            inference_engine_->SetInputDataAsync(tensor_names_.specific_target_headings, specific_target_headings_, cuda_stream_);
-            inference_engine_->SetInputDataAsync(tensor_names_.allowed_pred_num_tokens, allowed_pred_num_tokens_, cuda_stream_);
+        auto infer_start = std::chrono::steady_clock::now();
+
+        inference_engine_->SetInputData(tensor_names_.context_qpos, context_qpos_values_);
+        inference_engine_->SetInputData(tensor_names_.facing_direction, facing_direction_values_);
+        inference_engine_->SetInputData(tensor_names_.mode, mode_values_);
+        inference_engine_->SetInputData(tensor_names_.target_vel, target_vel_values_);
+        inference_engine_->SetInputData(tensor_names_.movement_direction, movement_direction_values_);
+        inference_engine_->SetInputData(tensor_names_.random_seed, random_seed_values_);
+
+        if (config_.version == 1 || config_.version == 2) {
+            inference_engine_->SetInputData(tensor_names_.target_height, target_height_values_);
+            inference_engine_->SetInputData(tensor_names_.has_specific_target, has_specific_target_);
+            inference_engine_->SetInputData(tensor_names_.specific_target_positions, specific_target_positions_);
+            inference_engine_->SetInputData(tensor_names_.specific_target_headings, specific_target_headings_);
+            inference_engine_->SetInputData(tensor_names_.allowed_pred_num_tokens, allowed_pred_num_tokens_);
         }
-        
-        cudaGraphLaunch(graphExec_, cuda_stream_);
-        inference_engine_->GetOutputDataAsync(tensor_names_.mujoco_qpos_output, mujoco_qpos_values_, cuda_stream_);
-        inference_engine_->GetOutputDataAsync(tensor_names_.num_pred_frames_output, num_pred_frames_values_, cuda_stream_);
-        cudaStreamSynchronize(cuda_stream_);
+
+        if (!inference_engine_->Enqueue(nullptr)) {
+            std::cerr << "[Planner] ✗ Inference failed!" << std::endl;
+            return;
+        }
+
+        inference_engine_->GetOutputData(tensor_names_.mujoco_qpos_output, mujoco_qpos_values_);
+        inference_engine_->GetOutputData(tensor_names_.num_pred_frames_output, num_pred_frames_values_);
+
+        auto infer_end = std::chrono::steady_clock::now();
+        auto latency_us = std::chrono::duration_cast<std::chrono::microseconds>(infer_end - infer_start).count();
+
+        // Periodic [Planner] summary line — only emitted when config_.log_summary
+        // is true. Sampled every 10 planner inferences (~1 Hz on the 10 Hz thread).
+        planner_infer_count_++;
+        planner_latency_sum_us_ += latency_us;
+        if (config_.log_summary && planner_infer_count_ % 10 == 1) {
+            bool has_nan = false, has_inf = false;
+            float max_abs_val = 0.0f;
+            for (size_t i = 0; i < mujoco_qpos_values_.size(); ++i) {
+                float v = mujoco_qpos_values_[i];
+                if (std::isnan(v)) { has_nan = true; break; }
+                if (std::isinf(v)) { has_inf = true; break; }
+                max_abs_val = std::max(max_abs_val, std::abs(v));
+            }
+            int num_pred = num_pred_frames_values_.empty() ? -1 : static_cast<int>(num_pred_frames_values_[0]);
+            double avg_latency = static_cast<double>(planner_latency_sum_us_) / planner_infer_count_;
+
+            std::cout << "[Planner] Inference #" << planner_infer_count_
+                      << " | latency: " << latency_us << "us"
+                      << " (avg: " << static_cast<int>(avg_latency) << "us)"
+                      << " | num_pred_frames: " << num_pred
+                      << " | max|qpos|: " << max_abs_val;
+            if (has_nan) std::cout << " | ⚠ NaN DETECTED";
+            if (has_inf) std::cout << " | ⚠ Inf DETECTED";
+            std::cout << " | mode: " << mode_values_[0]
+                      << " vel: " << target_vel_values_[0]
+                      << " dir: [" << movement_direction_values_[0] << ","
+                      << movement_direction_values_[1] << ","
+                      << movement_direction_values_[2] << "]"
+                      << std::endl;
+        }
     }
-    
-    /// Write new locomotion commands into pinned-memory input buffers.
+
+    /// Write new locomotion commands into input buffers.
     void UpdateInputTensors(int mode_value,
                            float target_vel,
                            float target_height,
@@ -389,28 +361,26 @@ private:
         // Update target velocity
         target_vel_values_[0] = target_vel;
 
-        if (config_.version == 1 || config_.version == 2)
-        {
-            // Update target height (version 1)
+        if (config_.version == 1 || config_.version == 2) {
             target_height_values_[0] = target_height;
         }
-        
+
         // Update movement direction
         movement_direction_values_[0] = movement_direction[0];
         movement_direction_values_[1] = movement_direction[1];
         movement_direction_values_[2] = movement_direction[2];
-        
+
         // Update facing direction
         facing_direction_values_[0] = facing_direction[0];
         facing_direction_values_[1] = facing_direction[1];
         facing_direction_values_[2] = facing_direction[2];
-        
+
         // Update random seed if provided
         if (random_seed != -1) {
             current_random_seed_ = random_seed;
             random_seed_values_[0] = random_seed;
         }
-        
+
         // Log replanning values
         std::cout << "Replanning with mode: ";
         switch(mode_values_[0])
@@ -669,13 +639,13 @@ private:
                   << ", movement: [" << movement_direction_values_[0] << ", " << movement_direction_values_[1] << ", " << movement_direction_values_[2] << "]"
                   << ", facing: [" << facing_direction_values_[0] << ", " << facing_direction_values_[1] << ", " << facing_direction_values_[2] << "]" << std::endl;
     }
-    
+
     virtual float *GetContextBuffer() override {
         return context_qpos_values_.data();
     }
     virtual int32_t GetNumPredFrames() override {
         return num_pred_frames_values_[0];
-    }   
+    }
     virtual const float *GetMujocoQposBuffer() override {
         return mujoco_qpos_values_.data();
     }

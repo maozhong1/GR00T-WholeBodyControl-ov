@@ -4,6 +4,17 @@ Parses a YAML-based WBC config via tyro CLI, instantiates the G1 robot model,
 and launches the simulator (optionally with offscreen image publishing).
 """
 
+import os
+
+# Disable CycloneDDS shared memory (iceoryx) for loopback simulation.
+# Prevents assertion crash on systems without iceoryx daemon.
+if "CYCLONEDDS_URI" not in os.environ:
+    os.environ["CYCLONEDDS_URI"] = (
+        "<CycloneDDS><Domain><SharedMemory>"
+        "<Enable>false</Enable>"
+        "</SharedMemory></Domain></CycloneDDS>"
+    )
+
 from typing import Dict
 
 import tyro

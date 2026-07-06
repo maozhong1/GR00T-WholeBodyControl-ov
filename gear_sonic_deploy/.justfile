@@ -15,11 +15,14 @@ default:
 # Get the number of cores
 CORES := if os() == "macos" { `sysctl -n hw.ncpu` } else if os() == "linux" { `nproc` } else { "1" }
 
+# Detect OpenVINO from environment
+OV_FLAG := if env("USE_OPENVINO", "0") == "1" { "-DUSE_OPENVINO=ON" } else { "" }
+
 # Build the project
 build *build_type='Release':
   @mkdir -p build
   @echo "Configuring the build system..."
-  @cd build && cmake -S .. -B . -DCMAKE_BUILD_TYPE={{build_type}} -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+  @cd build && cmake -S .. -B . -DCMAKE_BUILD_TYPE={{build_type}} -DCMAKE_EXPORT_COMPILE_COMMANDS=ON {{OV_FLAG}}
   @echo "Building the project..."
   @cd build && cmake --build . -j{{CORES}}
 

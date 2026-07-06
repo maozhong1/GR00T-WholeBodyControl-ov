@@ -384,6 +384,10 @@ EXTRA_ARGS=""
 if [[ "$ENV_TYPE" == "sim" ]]; then
     EXTRA_ARGS="--disable-crc-check"
     echo -e "${YELLOW}📋 Simulation mode: CRC check will be disabled${NC}"
+
+    # Disable CycloneDDS shared memory (iceoryx) on loopback — prevents assertion crash
+    export CYCLONEDDS_URI='<CycloneDDS><Domain><SharedMemory><Enable>false</Enable></SharedMemory></Domain></CycloneDDS>'
+    echo -e "${YELLOW}📋 Simulation mode: CycloneDDS shared memory disabled (loopback)${NC}"
     echo ""
 fi
 
@@ -393,18 +397,25 @@ fi
 
 echo -e "${BLUE}[Step 1/4]${NC} Checking prerequisites..."
 
-# Check for TensorRT
-if [ -z "$TensorRT_ROOT" ]; then
-    echo -e "${YELLOW}⚠️  TensorRT_ROOT is not set.${NC}"
-    echo "   Please ensure TensorRT is installed and add to your ~/.bashrc:"
-    echo "   export TensorRT_ROOT=\$HOME/TensorRT"
-    echo ""
-    echo "   Get TensorRT from: https://developer.nvidia.com/tensorrt/download/10x"
-    
-    # Check if it exists in common locations
-    if [ -d "$HOME/TensorRT" ]; then
-        echo -e "${GREEN}   Found TensorRT at ~/TensorRT - setting temporarily${NC}"
-        export TensorRT_ROOT="$HOME/TensorRT"
+# Check for inference backend prerequisites
+if [ "${USE_OPENVINO:-0}" = "1" ]; then
+    echo -e "${GREEN}✅ OpenVINO mode — TensorRT/CUDA not required${NC}"
+else
+    # Check for TensorRT (only when not using OpenVINO)
+    if [ -z "$TensorRT_ROOT" ]; then
+        echo -e "${YELLOW}⚠️  TensorRT_ROOT is not set.${NC}"
+        echo "   Please ensure TensorRT is installed and add to your ~/.bashrc:"
+        echo "   export TensorRT_ROOT=\$HOME/TensorRT"
+        echo ""
+        echo "   Get TensorRT from: https://developer.nvidia.com/tensorrt/download/10x"
+        echo ""
+        echo "   Alternatively, use OpenVINO: install OpenVINO and re-source setup_env.sh"
+
+        # Check if it exists in common locations
+        if [ -d "$HOME/TensorRT" ]; then
+            echo -e "${GREEN}   Found TensorRT at ~/TensorRT - setting temporarily${NC}"
+            export TensorRT_ROOT="$HOME/TensorRT"
+        fi
     fi
 fi
 
@@ -550,7 +561,14 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
     echo ""
     echo -e "${GREEN}🚀 Starting deployment...${NC}"
     echo ""
-    
+
+    # Ensure unitree_sdk2's bundled CycloneDDS is loaded (not ROS2's version)
+    # Mismatched libddsc (ROS2) + libddscxx (unitree) causes memory corruption
+    UNITREE_DDS_LIB="$SCRIPT_DIR/thirdparty/unitree_sdk2/thirdparty/lib/x86_64"
+    if [ -d "$UNITREE_DDS_LIB" ]; then
+        export LD_LIBRARY_PATH="$UNITREE_DDS_LIB:$LD_LIBRARY_PATH"
+    fi
+
     # Build the command with optional extra args
     if [[ -n "$EXTRA_ARGS" ]]; then
         just run g1_deploy_onnx_ref "$TARGET" "$CHECKPOINT_DECODER" "$MOTION_DATA" \
