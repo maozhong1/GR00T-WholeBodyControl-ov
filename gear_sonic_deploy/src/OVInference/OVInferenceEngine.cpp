@@ -166,8 +166,7 @@ bool OVInferenceEngine::Initialize(const std::string& modelPath, const std::stri
                     << " (NPU-only hint, using plugin default)" << std::endl;
         }
 
-        // Enable CPU pinning to reduce scheduling jitter on inference threads
-        config[ov::hint::enable_cpu_pinning.name()] = true;
+        config[ov::hint::enable_cpu_pinning.name()] = false;
 
         // Single inference request — no queuing overhead for real-time control
         config[ov::hint::num_requests.name()] = 1;
